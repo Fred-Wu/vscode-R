@@ -5,7 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { Agent } from 'http';
 import fetch from 'node-fetch';
-import { commands, StatusBarItem, Uri, ViewColumn, Webview, window, workspace, env, WebviewPanelOnDidChangeViewStateEvent, WebviewPanel } from 'vscode';
+import { commands, StatusBarItem, Uri, ViewColumn, Webview, window, workspace, env, WebviewPanelOnDidChangeViewStateEvent, WebviewPanel, EventEmitter } from 'vscode';
 
 import { runTextInTerm } from './rTerminal';
 import { FSWatcher } from 'fs-extra';
@@ -69,6 +69,15 @@ let activeBrowserExternalUri: Uri | undefined;
 
 // Add a map to track dataview panels by UUID
 const dataviewPanels = new Map<string, WebviewPanel>();
+
+let languageClient: any;
+export function setLanguageClient(client: any) {
+    languageClient = client;
+}
+
+// Provide an event to notify about session updates
+const onDidChangeDataEmitter = new EventEmitter<any>();
+export const onDidChangeData = onDidChangeDataEmitter.event;
 
 export function deploySessionWatcher(extensionPath: string): void {
     console.info(`[deploySessionWatcher] extensionPath: ${extensionPath}`);
@@ -223,6 +232,12 @@ async function updateWorkspace() {
             console.info('[updateWorkspace] File not found');
         }
     }
+
+    // Emit event after workspace update
+    onDidChangeDataEmitter.fire({
+        type: 'workspaceUpdate',
+        data: {}
+    });
 }
 
 export async function showBrowser(url: string, title: string, viewer: string | boolean): Promise<void> {
@@ -976,4 +991,30 @@ export async function sessionRequest(server: SessionServer, data: any): Promise<
 
         return undefined;
     }
+}
+
+export function processSessionUpdate(message: any): void {
+    if (message.type === 'loaded_packages') {
+        const newSearchPkgs = message.data.new_search || [];
+        const newNamespaces = message.data.new_namespaces || [];
+
+        if ((newSearchPkgs.length > 0 || newNamespaces.length > 0) && languageClient) {
+            const allNewPackages = [...newSearchPkgs, ...newNamespaces];
+
+            // Notify the language server about newly loaded packages
+            languageClient.sendNotification('workspace/didChangeConfiguration', {
+                settings: {
+                    r: {
+                        lsp: {
+                            loadedPackages: allNewPackages
+                        }
+                    }
+                }
+            });
+
+            console.log(`Notified language server about newly loaded packages: ${allNewPackages.join(', ')}`);
+        }
+    }
+
+    // ...existing code...
 }

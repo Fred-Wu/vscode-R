@@ -128,6 +128,11 @@ if (use_webserver) {
           })
           return(result)
         }
+      },
+      loaded_packages = function(packages, ...) {
+        # Log loaded packages for debugging
+        logger("Loaded packages:", packages)
+        return(packages)
       }
     )
 
@@ -373,12 +378,33 @@ workspace_file <- file.path(dir_session, "workspace.json")
 workspace_lock_file <- file.path(dir_session, "workspace.lock")
 file.create(workspace_lock_file, showWarnings = FALSE)
 
+prev_search <- search()
+prev_namespaces <- loadedNamespaces()
+
 update_workspace <- function(...) {
   tryCatch(
     {
+      current_search <- search()
+      current_namespaces <- loadedNamespaces()
+
+      # Detect newly loaded packages
+      new_search_pkgs <- setdiff(current_search, prev_search)
+      new_namespaces <- setdiff(current_namespaces, prev_namespaces)
+
+      if (length(new_search_pkgs) > 0 || length(new_namespaces) > 0) {
+        newly_loaded <- list(
+          new_search = new_search_pkgs,
+          new_namespaces = new_namespaces
+        )
+        request("loaded_packages", newly_loaded)
+      }
+
+      prev_search <<- current_search
+      prev_namespaces <<- current_namespaces
+
       data <- list(
-        search = search()[-1],
-        loaded_namespaces = loadedNamespaces(),
+        search = current_search[-1],
+        loaded_namespaces = current_namespaces,
         globalenv = if (show_globalenv) inspect_env(.GlobalEnv, globalenv_cache) else NULL
       )
       jsonlite::write_json(data, workspace_file, force = TRUE, pretty = FALSE)
@@ -993,3 +1019,22 @@ print.hsearch <- function(x, ...) {
 }
 
 reg.finalizer(.GlobalEnv, function(e) .vsc$request("detach"), onexit = TRUE)
+
+vsc_source_base <- base::source
+vsc_sourcing <- FALSE
+
+vsc_source_wrapper <- function(file, ...) {
+  if (!vsc_sourcing) {
+    vsc_sourcing <<- TRUE
+    on.exit({ vsc_sourcing <<- FALSE }, add = TRUE)
+    vsc_source_base(file, ...)
+    request("loaded_packages", data = list(
+      new_search = search(),
+      new_namespaces = loadedNamespaces()
+    ))
+  } else {
+    vsc_source_base(file, ...)
+  }
+}
+
+rebind("source", vsc_source_wrapper, "base")

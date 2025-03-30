@@ -148,6 +148,18 @@ export class LanguageService implements Disposable {
                     };
                 },
             },
+            initializationOptions: {
+                // Enable tracking of loaded packages
+                trackLoadedPackages: true,
+            },
+            middleware: {
+                workspace: {
+                    didChangeConfiguration: async (params, next) => {
+                        // Forward configuration changes to the language server
+                        await next(params);
+                    }
+                }
+            }
         };
 
         // Create the language client and start the client.
@@ -332,4 +344,11 @@ export class LanguageService implements Disposable {
         }
         return Promise.all(promises).then(() => undefined);
     }
+}
+
+export function getClient() {
+    return {
+        // Stub for the actual Language Client
+        // ...any existing or actual client logic...
+    };
 }

@@ -1,4 +1,3 @@
-
 'use strict';
 
 // interfaces, functions, etc. provided by vscode
@@ -24,7 +23,7 @@ import * as rShare from './liveShare';
 import * as httpgdViewer from './plotViewer';
 import * as languageService from './languageService';
 import { RTaskProvider } from './tasks';
-
+import { processSessionUpdate } from './session';
 
 // global objects used in other files
 export const homeExtDir = (): string => util.getDir(path.join(os.homedir(), '.vscode-R'));
@@ -58,6 +57,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<apiImp
     rmdPreviewManager = new rmarkdown.RMarkdownPreviewManager();
     rmdKnitManager = new rmarkdown.RMarkdownKnitManager();
 
+    // Subscribe to session watcher events
+    const sessionWatcherSubscription = session.onDidChangeData((data: unknown) => {
+        processSessionUpdate(data);
+    });
+    context.subscriptions.push(sessionWatcherSubscription);
 
     // register commands specified in package.json
     const commands = {
@@ -167,6 +171,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<apiImp
         } else {
             context.subscriptions.push(new languageService.LanguageService());
         }
+    } else {
+        const ls = new languageService.LanguageService();
+        session.setLanguageClient(languageService.getClient());
     }
 
     // register on-enter rule for roxygen comments
