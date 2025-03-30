@@ -2,7 +2,7 @@
   "name": "r",
   "displayName": "R",
   "description": "R Extension for Visual Studio Code",
-  "version": "2.8.4",
+  "version": "2.9.6",
   "author": "REditorSupport",
   "license": "SEE LICENSE IN LICENSE",
   "publisher": "REditorSupport",
@@ -31,7 +31,8 @@
   "activationEvents": [
     "workspaceContains:**/*.{rproj,Rproj,r,R,rd,Rd,rmd,Rmd}",
     "onCommand:r.runSelectionInActiveTerm",
-    "onWebviewPanel:rhelp"
+    "onWebviewPanel:rhelp",
+    "onWebviewPanel:rdataviewer"
   ],
   "main": "./dist/extension",
   "contributes": {
@@ -1871,6 +1872,11 @@
             }
           },
           "additionalProperties": false
+        },
+        "r.dataViewer.reuseWindow": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Reuse the existing data viewer window when `View()` is called multiple times. When enabled, only one data viewer window will be shown and refreshed with new data."
         },
         "r.rtermSendDelay": {
           "type": "integer",
