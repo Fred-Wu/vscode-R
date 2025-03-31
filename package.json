@@ -2097,6 +2097,7 @@
     "@types/express": "^4.17.12",
     "@types/fs-extra": "^9.0.11",
     "@types/glob": "^8.0.0",
+    "@types/highlight.js": "^10.1.0",
     "@types/js-yaml": "^4.0.2",
     "@types/mocha": "^8.2.2",
     "@types/node": "^18.17.1",
@@ -2107,7 +2108,6 @@
     "@typescript-eslint/eslint-plugin": "^5.30.0",
     "@typescript-eslint/parser": "^5.30.0",
     "@vscode/test-electron": "^2.2.3",
-    "@types/highlight.js": "^10.1.0",
     "copy-webpack-plugin": "^9.0.0",
     "devreplay": "^1.9.31",
     "eslint": "^7.28.0",
@@ -2120,6 +2120,7 @@
     "webpack-cli": "^4.7.2"
   },
   "dependencies": {
+    "@vscode/vsce": "^3.3.1",
     "ag-grid-community": "^31.3.2",
     "cheerio": "1.0.0-rc.12",
     "crypto": "^1.0.1",
