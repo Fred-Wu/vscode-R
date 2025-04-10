@@ -17,28 +17,28 @@ import { homeExtDir, rWorkspace, globalRHelp, globalHttpgdManager, extensionCont
 import { UUID, rHostService, rGuestService, isLiveShare, isHost, isGuestSession, closeBrowser, guestResDir, shareBrowser, openVirtualDoc, shareWorkspace } from './liveShare';
 
 export interface GlobalEnv {
-    [key: string]: {
-        class: string[];
-        type: string;
-        length: number;
-        str: string;
-        size?: number;
-        dim?: number[],
-        names?: string[],
-        slots?: string[]
-    }
+  [key: string]: {
+    class: string[];
+    type: string;
+    length: number;
+    str: string;
+    size?: number;
+    dim?: number[],
+    names?: string[],
+    slots?: string[]
+  }
 }
 
 export interface WorkspaceData {
-    search: string[];
-    loaded_namespaces: string[];
-    globalenv: GlobalEnv;
+  search: string[];
+  loaded_namespaces: string[];
+  globalenv: GlobalEnv;
 }
 
 export interface SessionServer {
-    host: string;
-    port: number;
-    token: string;
+  host: string;
+  port: number;
+  token: string;
 }
 
 export let workspaceData: WorkspaceData;
@@ -66,6 +66,9 @@ let plotWatcher: FSWatcher;
 let activeBrowserPanel: WebviewPanel | undefined;
 let activeBrowserUri: Uri | undefined;
 let activeBrowserExternalUri: Uri | undefined;
+
+// Add a map to track dataview panels by UUID
+const dataviewPanels = new Map<string, WebviewPanel>();
 
 export function deploySessionWatcher(extensionPath: string): void {
     console.info(`[deploySessionWatcher] extensionPath: ${extensionPath}`);
@@ -334,15 +337,59 @@ export async function showWebView(file: string, title: string, viewer: string | 
     console.info('[showWebView] Done');
 }
 
-export async function showDataView(source: string, type: string, title: string, file: string, viewer: string): Promise<void> {
-    console.info(`[showDataView] source: ${source}, type: ${type}, title: ${title}, file: ${file}, viewer: ${viewer}`);
+export async function showDataView(source: string, type: string, title: string, file: string, viewer: string, dataview_uuid?: string): Promise<void> {
+    console.info(`[showDataView] source: ${source}, type: ${type}, title: ${title}, file: ${file}, viewer: ${viewer}, dataview_uuid: ${dataview_uuid}`);
 
     if (isGuestSession) {
         resDir = guestResDir;
     }
 
+    // Check if we have an existing panel with this UUID
+    let panel: WebviewPanel | undefined;
+    if (dataview_uuid && dataviewPanels.has(dataview_uuid)) {
+        panel = dataviewPanels.get(dataview_uuid);
+        // Panel might have been closed, check if it's still valid
+        if (panel) {
+            try {
+                panel.title = title; // Update title
+                panel.reveal(ViewColumn[viewer as keyof typeof ViewColumn]);
+
+                if (source === 'table') {
+                    // Update existing panel content
+                    const content = await getTableHtml(panel.webview, file);
+                    panel.webview.html = content;
+                } else if (source === 'list') {
+                    const content = await getListHtml(panel.webview, file);
+                    panel.webview.html = content;
+                } else {
+                    // For other types, we'll still reopen, but use the existing panel
+                    if (isGuestSession) {
+                        const fileContent = await rGuestService?.requestFileContent(file, 'utf8');
+                        if (fileContent) {
+                            await openVirtualDoc(file, fileContent, true, true, ViewColumn[viewer as keyof typeof ViewColumn]);
+                        }
+                    } else {
+                        await commands.executeCommand('vscode.open', Uri.file(file), {
+                            preserveFocus: true,
+                            preview: true,
+                            viewColumn: ViewColumn[viewer as keyof typeof ViewColumn],
+                        });
+                    }
+                }
+                console.info('[showDataView] Updated existing panel');
+                return;
+            } catch (e) {
+                console.log(`Panel was disposed, creating new one: ${e}`);
+                // Panel was disposed, remove from registry
+                dataviewPanels.delete(dataview_uuid);
+                panel = undefined;
+            }
+        }
+    }
+
+    // Create a new panel if needed
     if (source === 'table') {
-        const panel = window.createWebviewPanel('dataview', title,
+        panel = window.createWebviewPanel('dataview', title,
             {
                 preserveFocus: true,
                 viewColumn: ViewColumn[viewer as keyof typeof ViewColumn],
@@ -356,8 +403,16 @@ export async function showDataView(source: string, type: string, title: string, 
         const content = await getTableHtml(panel.webview, file);
         panel.iconPath = new UriIcon('open-preview');
         panel.webview.html = content;
+
+        // Register panel if we have a UUID
+        if (dataview_uuid) {
+            dataviewPanels.set(dataview_uuid, panel);
+            panel.onDidDispose(() => {
+                dataviewPanels.delete(dataview_uuid!);
+            });
+        }
     } else if (source === 'list') {
-        const panel = window.createWebviewPanel('dataview', title,
+        panel = window.createWebviewPanel('dataview', title,
             {
                 preserveFocus: true,
                 viewColumn: ViewColumn[viewer as keyof typeof ViewColumn],
@@ -371,6 +426,14 @@ export async function showDataView(source: string, type: string, title: string, 
         const content = await getListHtml(panel.webview, file);
         panel.iconPath = new UriIcon('open-preview');
         panel.webview.html = content;
+
+        // Register panel if we have a UUID
+        if (dataview_uuid) {
+            dataviewPanels.set(dataview_uuid, panel);
+            panel.onDidDispose(() => {
+                dataviewPanels.delete(dataview_uuid!);
+            });
+        }
     } else {
         if (isGuestSession) {
             const fileContent = await rGuestService?.requestFileContent(file, 'utf8');
@@ -469,7 +532,7 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
     [class*="vscode"] div.ag-menu {
         background-color: var(--vscode-notifications-background);
         color: var(--vscode-notifications-foreground);
-        border-color: var(--vscode-notifications-border);
+        border-color: var (--vscode-notifications-border);
     }
 
     [class*="vscode"] div.ag-filter-apply-panel-button {
@@ -720,8 +783,8 @@ export async function writeResponse(responseData: Record<string, unknown>, respo
     const responseLockFile = path.join(responseSessionDir, 'response.lock');
     if (!fs.existsSync(responseFile) || !fs.existsSync(responseLockFile)) {
         throw ('Received a request from R for response' +
-            'to a session directiory that does not contain response.log or response.lock: ' +
-            responseSessionDir);
+      'to a session directiory that does not contain response.log or response.lock: ' +
+      responseSessionDir);
     }
     const responseString = JSON.stringify(responseData);
     console.info('[writeResponse] Started');
@@ -737,8 +800,9 @@ export async function writeSuccessResponse(responseSessionDir: string): Promise<
 }
 
 type ISessionRequest = {
-    plot_url?: string,
-    server?: SessionServer
+  plot_url?: string,
+  server?: SessionServer,
+  dataview_uuid?: string  // Add this property to match the R code
 } & IRequest;
 
 async function updateRequest(sessionStatusBarItem: StatusBarItem) {
@@ -753,7 +817,7 @@ async function updateRequest(sessionStatusBarItem: StatusBarItem) {
         console.info(`[updateRequest] request: ${requestContent}`);
         const request = JSON.parse(requestContent) as ISessionRequest;
         if (request.wd && isFromWorkspace(request.wd)) {
-            if (request.uuid === null || request.uuid === undefined || request.uuid === UUID) {
+            if (request.uuid === null || request.uuid === undefined || String(request.uuid) === String(UUID)) {
                 switch (request.command) {
                     case 'help': {
                         if (globalRHelp && request.requestPath) {
@@ -818,8 +882,9 @@ async function updateRequest(sessionStatusBarItem: StatusBarItem) {
                     }
                     case 'dataview': {
                         if (request.source && request.type && request.file && request.title && request.viewer !== undefined) {
+                            // Use dataview_uuid for panel tracking, preserve uuid for LiveShare
                             await showDataView(request.source,
-                                request.type, request.title, request.file, request.viewer);
+                                request.type, request.title, request.file, request.viewer, request.dataview_uuid);
                         }
                         break;
                     }
