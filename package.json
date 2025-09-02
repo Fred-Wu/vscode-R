@@ -49,8 +49,7 @@
         {
           "id": "workspaceViewer",
           "title": "R",
-          "icon": "./images/Rlogo.svg",
-          "when": "r.isActive"
+          "icon": "./images/Rlogo.svg"
         }
       ]
     },
@@ -60,21 +59,22 @@
           "id": "workspaceViewer",
           "name": "Workspace",
           "icon": "./images/Rlogo.svg",
-          "contextualTitle": "R"
+          "contextualTitle": "R",
+          "when": "rSessionActive"
         },
         {
           "id": "rHelpPages",
           "name": "Help Pages",
           "icon": "./images/Rlogo.svg",
           "contextualTitle": "R",
-          "when": "r.helpViewer.show"
+          "when": "rSessionActive && r.helpViewer.show"
         },
         {
           "id": "rLiveShare",
           "name": "Live Share Controls",
           "icon": "./images/Rlogo.svg",
           "contextualTitle": "R",
-          "when": "r.WorkspaceViewer:show && !r.liveShare:isGuest",
+          "when": "rSessionActive && r.WorkspaceViewer:show && !r.liveShare:isGuest",
           "visibility": "collapsed"
         }
       ]
@@ -82,22 +82,23 @@
     "viewsWelcome": [
       {
         "view": "workspaceViewer",
-        "when": "!r.WorkspaceViewer:show",
+        "when": "rSessionActive && !r.WorkspaceViewer:show",
         "contents": "R workspace viewer requires that the [session watcher be enabled](https://github.com/REditorSupport/vscode-R/wiki/R-Session-watcher)."
       },
       {
         "view": "rHelpPages",
-        "contents": "R Help Pages"
+        "contents": "R Help Pages",
+        "when": "rSessionActive"
       },
       {
         "view": "rLiveShare",
         "contents": "R Live Share not active.",
-        "when": "!r.liveShare:aborted"
+        "when": "rSessionActive && !r.liveShare:aborted"
       },
       {
         "view": "rLiveShare",
         "contents": "Could not connect to Live Share service.",
-        "when": "r.liveShare:aborted"
+        "when": "rSessionActive && r.liveShare:aborted"
       }
     ],
     "languages": [

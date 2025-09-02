@@ -1033,7 +1033,7 @@ async function updateRequest(sessionStatusBarItem: StatusBarItem) {
                     }
                     case 'attach': {
                         if (!request.tempdir || !request.wd) {
-                            return;
+                            break;
                         }
                         rVer = String(request.version);
                         pid = String(request.pid);
@@ -1041,10 +1041,11 @@ async function updateRequest(sessionStatusBarItem: StatusBarItem) {
                         sessionDir = path.join(request.tempdir, 'vscode-R');
                         workingDir = request.wd;
                         console.info(`[updateRequest] attach PID: ${pid}`);
+                        sessionStatusBarItem?.show();
                         sessionStatusBarItem.text = `R ${rVer}: ${pid}`;
                         // eslint-disable-next-line @typescript-eslint/restrict-template-expressions, @typescript-eslint/no-unsafe-member-access
                         sessionStatusBarItem.tooltip = `${info?.version}\nProcess ID: ${pid}\nCommand: ${info?.command}\nStart time: ${info?.start_time}\nClick to attach to active terminal.`;
-                        sessionStatusBarItem.show();
+                      //sessionStatusBarItem.show();  
                         updateSessionWatcher();
 
                         if (request.server) {
@@ -1065,6 +1066,7 @@ async function updateRequest(sessionStatusBarItem: StatusBarItem) {
                         if (request.pid) {
                             await cleanupSession(request.pid);
                         }
+                        await setContext('rSessionActive', false);
                         break;
                     }
                     case 'browser': {

@@ -52,6 +52,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<apiImp
 
     // assign extension context to global variable
     extensionContext = context;
+    
+        // hide R activity icon until a session attaches
+    void vscode.commands.executeCommand('setContext', 'rSessionActive', false);
 
     // assign session watcher setting to global variable
     enableSessionWatcher = util.config().get<boolean>('sessionWatcher') ?? false;
