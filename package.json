@@ -2,7 +2,7 @@
   "name": "r",
   "displayName": "R",
   "description": "R Extension for Visual Studio Code",
-  "version": "2.8.6",
+  "version": "2.8.7",
   "author": "REditorSupport",
   "license": "SEE LICENSE IN LICENSE",
   "publisher": "REditorSupport",
@@ -266,6 +266,11 @@
         "title": "Create R terminal",
         "category": "R",
         "command": "r.createRTerm"
+      },
+      {
+        "title": "Create R terminal in Side Editor",
+        "category": "R",
+        "command": "r.createRTermSide"
       },
       {
         "title": "Run Source",
