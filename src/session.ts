@@ -736,16 +736,19 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
             return params.data.x2;
         },
 
-        suppressColumnVirtualisation: true,
+        suppressColumnVirtualisation: false,
         alwaysShowVerticalScroll: true,
         debounceVerticalScrollbar: true,
         
         ensureDomOrder: true,
         rowHeight: 25,
         rowModelType: 'infinite',
-        cacheBlockSize: 100,
-        maxBlocksInCache: 20,
-        infiniteInitialRowCount: 100,
+        cacheBlockSize: 50,
+        maxBlocksInCache: 100,
+        infiniteInitialRowCount: 50,
+        cacheOverflowSize: 2,
+        maxConcurrentDatasourceRequests: 2,
+        
         rowBuffer: 5,
         blockLoadDebounceMillis: 300,
       
@@ -753,8 +756,6 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
         enableCellTextSelection: true,
         suppressRowTransform: true,
         animateRows: false,
-        
-        onFirstDataRendered: onFirstDataRendered,
         
         onSortChanged: function(params) {
             params.api.purgeInfiniteCache();
@@ -764,11 +765,6 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
           params.api.purgeInfiniteCache();
         }
       };
-    
-    function onFirstDataRendered(params) {
-        params.api.autoSizeAllColumns(false);
-
-    }
     
     function updateTheme() {
         const gridDiv = document.querySelector('#myGrid');
@@ -794,6 +790,11 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
 
         displayDataSource.api = gridApi;        
         gridApi.setGridOption('datasource', displayDataSource);
+
+        const columnsToSize = columnDefs
+            .filter(col => col.field !== 'x1')
+            .map(col => col.field);
+        gridApi.autoSizeColumns(columnsToSize, false);
         
         window.addEventListener('message', event => {
             const msg = event.data;
@@ -801,9 +802,12 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
 
               gridApi.setFilterModel(null);
               gridApi.onFilterChanged();            
-
               gridApi.resetColumnState();      
-              gridApi.autoSizeAllColumns(false);
+
+              const columnsToSize = columnDefs
+                  .filter(col => col.field !== 'x1')
+                  .map(col => col.field);
+              gridApi.autoSizeColumns(columnsToSize, false);
 
               gridApi.purgeInfiniteCache();           
               gridApi.ensureIndexVisible(0, 'top');   
