@@ -152,6 +152,25 @@ export async function createRTerm(preserveshow?: boolean): Promise<boolean> {
     return true;
 }
 
+export async function createRTermSide(): Promise<boolean> {
+    const termOptions = await makeTerminalOptions();
+    const termPath = termOptions.shellPath;
+    if(!termPath){
+        void vscode.window.showErrorMessage('Could not find R path. Please check r.term and r.path setting.');
+        return false;
+    } else if(!fs.existsSync(termPath)){
+        void vscode.window.showErrorMessage(`Cannot find R client at ${termPath}. Please check r.rterm setting.`);
+        return false;
+    }
+    
+    // Set location to create terminal directly in editor area
+    (termOptions as any).location = { viewColumn: vscode.ViewColumn.Beside };
+    
+    rTerm = vscode.window.createTerminal(termOptions);
+    rTerm.show(true);
+    return true;
+}
+
 export async function restartRTerminal(): Promise<void>{
     if (typeof rTerm !== 'undefined'){
         rTerm.dispose();
