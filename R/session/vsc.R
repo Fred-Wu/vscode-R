@@ -829,6 +829,19 @@ attach <- function() {
     if (rstudioapi_enabled()) {
         rstudioapi_util_env$update_addin_registry(addin_registry)
     }
+    plot_url <- NULL
+    if (use_httpgd && requireNamespace("httpgd", quietly = TRUE)) {
+        tryCatch(
+            {
+                if (length(httpgd::hgd_details()) > 0) {
+                    plot_url <- httpgd::hgd_url()
+                }
+            },
+            error = function(e) {
+                plot_url <<- NULL
+            }
+        )
+    }
     request("attach",
         version = sprintf("%s.%s", R.version$major, R.version$minor),
         tempdir = tempdir,
@@ -837,12 +850,16 @@ attach <- function() {
             version = R.version.string,
             start_time = format(file.info(tempdir)$ctime)
         ),
-        plot_url = if (identical(names(dev.cur()), "httpgd")) httpgd::hgd_url(),
-        server = if (use_webserver) list(
-            host = host,
-            port = port,
-            token = token
-        ) else NULL
+        plot_url = plot_url,
+        server = if (use_webserver) {
+            list(
+                host = host,
+                port = port,
+                token = token
+            )
+        } else {
+            NULL
+        }
     )
 }
 
