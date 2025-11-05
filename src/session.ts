@@ -1049,7 +1049,7 @@ async function updateRequest(sessionStatusBarItem: StatusBarItem) {
                         sessionStatusBarItem.text = `R ${rVer}: ${pid}`;
                         // eslint-disable-next-line @typescript-eslint/restrict-template-expressions, @typescript-eslint/no-unsafe-member-access
                         sessionStatusBarItem.tooltip = `${info?.version}\nProcess ID: ${pid}\nCommand: ${info?.command}\nStart time: ${info?.start_time}\nClick to attach to active terminal.`;
-                      //sessionStatusBarItem.show();  
+                        //sessionStatusBarItem.show();  
                         updateSessionWatcher();
 
                         if (request.server) {
