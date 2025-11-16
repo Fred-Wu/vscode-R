@@ -286,14 +286,10 @@ export async function runTextInTerm(text: string, execute: boolean = true): Prom
         rGuestService?.requestRunTextInTerm(text);
     } else {
         const term = await chooseTerminal();
-        if (term === undefined) {
-            return;
+        if (term === undefined) { return;
         }
         if (config().get<boolean>('bracketedPaste')) {
-            if (process.platform !== 'win32') {
-                // Surround with ANSI control characters for bracketed paste mode
-                text = `\x1b[200~${text}\x1b[201~`;
-            }
+            text = `\x1b[200~${text}\x1b[201~`;                                             
             term.sendText(text, execute);
         } else {
             const rtermSendDelay: number = config().get('rtermSendDelay') || 8;
