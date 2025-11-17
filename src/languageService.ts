@@ -146,7 +146,8 @@ export class LanguageService implements Disposable {
                 },
                 closed: () => {
                     return {
-                        action: CloseAction.DoNotRestart
+                        action: CloseAction.DoNotRestart,
+                        handled: true
                     };
                 },
             },
@@ -167,17 +168,21 @@ export class LanguageService implements Disposable {
     private isClientInitializing(name: string): boolean {
         return this.initSet.has(name);
     }
-
-    private getKey(uri: Uri): string {
-        switch (uri.scheme) {
-            case 'untitled':
-                return uri.scheme;
-            case 'vscode-notebook-cell':
-                return `vscode-notebook:${uri.fsPath}`;
-            default:
-                return uri.toString(true);
+    
+    private isQuartoChunkTempUri(uriString: string): boolean {
+        try {
+            const uri = Uri.parse(uriString);
+            if (uri.scheme !== 'file') {
+                return false;
+            }
+            const fsPath = uri.fsPath;
+            // Quarto temp docs look like: /var/.../tmp-.../.vdoc.<uuid>.r
+            return fsPath.includes('.vdoc.') && fsPath.toLowerCase().endsWith('.r');
+        } catch {
+            return false;
         }
     }
+
 
     private getServerKey(document: TextDocument): string | null {
         // For workspace files, use workspace folder URI as key
@@ -208,7 +213,7 @@ export class LanguageService implements Disposable {
         if (!this.openDocuments.has(serverKey)) {
             this.openDocuments.set(serverKey, new Set());
         }
-        this.openDocuments.get(serverKey)!.add(documentUri);
+        this.openDocuments.get(serverKey)?.add(documentUri);
     }
 
     private untrackDocument(serverKey: string, documentUri: string): boolean {
@@ -221,6 +226,11 @@ export class LanguageService implements Disposable {
             }
         }
         return false; // Still has open documents
+    }
+    
+    private stopAndDisposeClient(client: LanguageClient): Thenable<void> {
+        client.clientOptions.errorHandler = undefined;
+        return client.stop().then(() => client.dispose());
     }
 
     private startMultiLanguageService(self: LanguageService): void {
@@ -310,28 +320,53 @@ export class LanguageService implements Disposable {
         }
 
         function didCloseTextDocument(document: TextDocument): void {
-            if (document.languageId !== 'r' && document.languageId !== 'rmd') {
+            const isRDoc = document.languageId === 'r' || document.languageId === 'rmd';
+            const isQuartoDoc = document.uri.fsPath.toLowerCase().endsWith('.qmd');
+
+            // Normal R / Rmd behaviour (unchanged)
+            if (isRDoc) {
+                const serverKey = self.getServerKey(document);
+                if (!serverKey) {
+                    return;
+                }
+
+                const shouldStop = self.untrackDocument(serverKey, document.uri.toString(true));
+                if (shouldStop) {
+                    const client = self.clients.get(serverKey);
+                    if (client) {
+                        console.log(`Stopping language server for: ${serverKey}`);
+                        self.clients.delete(serverKey);
+                        self.initSet.delete(serverKey);
+                        void self.stopAndDisposeClient(client);
+                    }
+                }
                 return;
             }
 
-            const serverKey = self.getServerKey(document);
-            if (!serverKey) {
-                return;
-            }
+            // Extra: when a Quarto document (.qmd) closes, immediately
+            // stop any clients that only serve Quarto temp chunk docs
+            if (isQuartoDoc) {
+                for (const [serverKey, client] of self.clients.entries()) {
+                    const docs = self.openDocuments.get(serverKey);
+                    if (!docs || docs.size === 0) {
+                        continue;
+                    }
 
-            // Untrack this document and check if we should stop the server
-            const shouldStop = self.untrackDocument(serverKey, document.uri.toString(true));
-            
-            if (shouldStop) {
-                const client = self.clients.get(serverKey);
-                if (client) {
-                    console.log(`Stopping language server for: ${serverKey}`);
-                    self.clients.delete(serverKey);
-                    self.initSet.delete(serverKey);
-                    void client.stop();
+                    const allQuartoTemp = Array.from(docs).every(uriStr =>
+                        self.isQuartoChunkTempUri(uriStr)
+                    );
+
+                    if (allQuartoTemp) {
+                        console.log(`Stopping language server for Quarto chunks: ${serverKey} (closed ${document.uri.toString(true)})`);
+                        self.openDocuments.delete(serverKey);
+                        self.clients.delete(serverKey);
+                        self.initSet.delete(serverKey);
+                        void self.stopAndDisposeClient(client);
+                    }
                 }
             }
         }
+
 
         workspace.onDidOpenTextDocument(didOpenTextDocument);
         workspace.onDidCloseTextDocument(didCloseTextDocument);
@@ -346,7 +381,7 @@ export class LanguageService implements Disposable {
                     self.clients.delete(serverKey);
                     self.initSet.delete(serverKey);
                     self.openDocuments.delete(serverKey);
-                    void client.stop();
+                    void self.stopAndDisposeClient(client);
                 }
             }
         });
@@ -383,7 +418,7 @@ export class LanguageService implements Disposable {
                     console.log('Stopping single language server - no R files open');
                     const client = self.client;
                     self.client = undefined;
-                    void client.stop();
+                    void self.stopAndDisposeClient(client);
                 }
             };
 
@@ -411,10 +446,10 @@ export class LanguageService implements Disposable {
     private stopLanguageService(): Thenable<void> {
         const promises: Thenable<void>[] = [];
         if (this.client) {
-            promises.push(this.client.stop());
+            promises.push(this.stopAndDisposeClient(this.client));
         }
         for (const client of this.clients.values()) {
-            promises.push(client.stop());
+            promises.push(this.stopAndDisposeClient(client));
         }
         this.clients.clear();
         this.initSet.clear();
