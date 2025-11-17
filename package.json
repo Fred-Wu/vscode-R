@@ -2,7 +2,7 @@
   "name": "r",
   "displayName": "R",
   "description": "R Extension for Visual Studio Code",
-  "version": "3.0.1",
+  "version": "3.0.2",
   "author": "REditorSupport",
   "license": "SEE LICENSE IN LICENSE",
   "publisher": "REditorSupport",
@@ -32,7 +32,9 @@
     "workspaceContains:**/*.{rproj,Rproj,r,R,rd,Rd,rmd,Rmd}",
     "onCommand:r.runSelectionInActiveTerm",
     "onWebviewPanel:rhelp",
-    "onWebviewPanel:rdataviewer"
+    "onWebviewPanel:rdataviewer",
+    "onLanguage:r",
+    "onLanguage:rmd"
   ],
   "main": "./dist/extension",
   "contributes": {
