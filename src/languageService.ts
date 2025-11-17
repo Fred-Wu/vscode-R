@@ -183,6 +183,12 @@ export class LanguageService implements Disposable {
         }
     }
 
+    private isUntitledQuartoDoc(document: TextDocument): boolean {
+        return document.uri.scheme === 'untitled' &&
+            (document.languageId === 'quarto' ||
+                document.languageId === 'r' ||
+                document.languageId === 'rmd');
+    }
 
     private getServerKey(document: TextDocument): string | null {
         // For workspace files, use workspace folder URI as key
@@ -345,7 +351,7 @@ export class LanguageService implements Disposable {
 
             // Extra: when a Quarto document (.qmd) closes, immediately
             // stop any clients that only serve Quarto temp chunk docs
-            if (isQuartoDoc) {
+            if (isQuartoDoc || self.isUntitledQuartoDoc(document)) {
                 for (const [serverKey, client] of self.clients.entries()) {
                     const docs = self.openDocuments.get(serverKey);
                     if (!docs || docs.size === 0) {

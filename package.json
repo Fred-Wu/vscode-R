@@ -30,9 +30,6 @@
   },
   "activationEvents": [
     "workspaceContains:**/*.{rproj,Rproj,r,R,rd,Rd,rmd,Rmd}",
-    "onCommand:r.runSelectionInActiveTerm",
-    "onWebviewPanel:rhelp",
-    "onWebviewPanel:rdataviewer",
     "onLanguage:r",
     "onLanguage:rmd"
   ],
