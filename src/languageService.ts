@@ -248,6 +248,18 @@ export class LanguageService implements Disposable {
             if (document.languageId !== 'r' && document.languageId !== 'rmd') {
                 return;
             }
+            
+            if (document.uri.scheme === 'file') {
+              const path = document.uri.fsPath.toLowerCase();
+              // Detect R's temporary source files in Rtmp* folders
+              const isRTempFile = path.includes('rtmp') && 
+                                  (path.endsWith('.r') || path.endsWith('.R')) &&
+                                  !path.includes('.vdoc.');
+
+              if (isRTempFile) {
+                  return; 
+              }
+            }
 
             const serverKey = self.getServerKey(document);
             if (!serverKey) {

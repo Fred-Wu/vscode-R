@@ -219,7 +219,7 @@ export class RHelp implements api.HelpPanel, vscode.WebviewPanelSerializer<strin
     readonly cwd?: string
 
     // Provides the content of help pages:
-    readonly helpProvider: HelpProvider
+    private _helpProvider: HelpProvider | undefined
 
     // Provides a list of aliases:
     readonly aliasProvider: AliasProvider
@@ -254,14 +254,6 @@ export class RHelp implements api.HelpPanel, vscode.WebviewPanelSerializer<strin
         this.rPath = options.rPath;
         this.webviewScriptFile = vscode.Uri.file(options.webviewScriptPath);
         this.webviewStyleFile = vscode.Uri.file(options.webviewStylePath);
-        const pkgListener = () => {
-            console.log('Restarting Help Server...');
-            void this.refresh(true);
-        };
-        this.helpProvider = new HelpProvider({
-            ...options,
-            pkgListener: pkgListener,
-        });
         this.aliasProvider = new AliasProvider(options);
         const previewListener = (previewer: RLocalHelpPreviewer) => {
             console.log(`Refreshing R Help preview: ${previewer.packageDir}`);
@@ -287,11 +279,34 @@ export class RHelp implements api.HelpPanel, vscode.WebviewPanelSerializer<strin
         await this.showHelpForPath(path, undefined, true, panel);
         return;
     }
+    
+    private get helpProvider(): HelpProvider {
+        if (!this._helpProvider) {
+            const pkgListener = () => {
+                console.log('Restarting Help Server...');
+                void this.refresh(true);
+            };
+            this._helpProvider = new HelpProvider({
+                rPath: this.rPath,
+                cwd: this.cwd,
+                pkgListener: pkgListener,
+            });
+        }
+        return this._helpProvider;
+    }
+
+    public cleanupHelpProvider(): void {
+        if (this._helpProvider) {
+            this._helpProvider.dispose();
+            this._helpProvider = undefined;
+            console.log('[R Help] Help provider disposed - R processes stopped');
+        }
+    }
 
     // used to close files, stop servers etc.
     public dispose(): void {
         const children = [
-            this.helpProvider,
+            this._helpProvider,
             this.aliasProvider,
             this.packageManager,
             this.treeViewWrapper,

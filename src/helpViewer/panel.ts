@@ -131,6 +131,12 @@ export class HelpPanel {
             this.webviewScriptUri = undefined;
             this.webviewStyleUri = undefined;
             void this.setContextValues();
+            const hasOpenHelpPanels = this.rHelp.helpPanels.some(panel => panel.panel !== undefined);    
+                  
+            if (!hasOpenHelpPanels) {
+                this.rHelp.cleanupHelpProvider();
+            }
+          
         });
 
         // sent by javascript added to the help pages, e.g. when a link or mouse button is clicked
