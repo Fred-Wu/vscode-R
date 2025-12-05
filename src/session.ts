@@ -501,7 +501,17 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
             console.error('[getTableHtml] Empty content');
             throw new Error('Empty content in getTableHtml');
         }
-        //const data = JSON.parse(content);
+
+        // Parse once — we use this for both metadata detection and injection
+        let parsedData: any;
+        try {
+            parsedData = JSON.parse(content);
+        } catch (e) {
+            throw new Error('Failed to parse JSON from R dataview');
+        }
+
+        const hasTotalRows = typeof parsedData.totalRows === 'number';
+
         return `
 <!DOCTYPE html>
 <html lang="en">
@@ -515,77 +525,85 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
         margin: 0;
         box-sizing: border-box;
         -webkit-overflow-scrolling: touch;
+        position: relative;
     }
 
-    html {
+    /* NEW: Loading overlay — shows instantly */
+    #loadingOverlay {
         position: absolute;
-        top: 0;
-        left: 0;
-        padding: 0;
-        overflow: auto;
+        top: 0; left: 0; width: 100%; height: 100%;
+        background: var(--vscode-editor-background);
+        color: var(--vscode-editor-foreground);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        z-index: 1000;
+        transition: opacity 0.4s ease-out;
+        font-family: var(--vscode-editor-font-family);
+    }
+    #loadingOverlay.hidden {
+        opacity: 0;
+        pointer-events: none;
+    }
+    .spinner {
+        font-size: 48px;
+        opacity: 0.15;
+        margin-bottom: 16px;
+        animation: spin 1.5s linear infinite;
+    }
+    @keyframes spin {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
+    }
+    #rowInfo {
+        margin-top: 12px;
+        font-size: 14px;
+        color: var(--vscode-descriptionForeground);
     }
 
-    body {
-        padding: 0;
-        overflow: auto;
-    }
-
-    /* Styling for wrapper and header */
-
+    /* Your original styles (unchanged) */
     [class*="vscode"] div.ag-root-wrapper {
         background-color: var(--vscode-editor-background);
     }
-
     [class*="vscode"] div.ag-header {
         background-color: var(--vscode-sideBar-background);
     }
-
-    [class*="vscode"] div.ag-header-cell[aria-sort="ascending"], div.ag-header-cell[aria-sort="descending"] {
+    [class*="vscode"] div.ag-header-cell[aria-sort="ascending"], 
+    [class*="vscode"] div.ag-header-cell[aria-sort="descending"] {
         color: var(--vscode-textLink-activeForeground);
     }
-    
-    [class*="vscode"] div.ag-header-cell.ag-header-cell-filtered, div.ag-header-cell[aria-filtered="true"] {
+    [class*="vscode"] div.ag-header-cell.ag-header-cell-filtered, 
+    [class*="vscode"] div.ag-header-cell[aria-filtered="true"] {
       color: var(--vscode-textLink-activeForeground);
     }
-
-    /* Styling for rows and cells */
-
     [class*="vscode"] div.ag-row {
         color: var(--vscode-editor-foreground);
     }
-
     [class*="vscode"] .ag-row-hover {
         background-color: var(--vscode-list-hoverBackground) !important;
         color: var(--vscode-list-hoverForeground);
     }
-
     [class*="vscode"] .ag-row-selected {
         background-color: var(--vscode-editor-selectionBackground) !important;
         color: var(--vscode-editor-selectionForeground) !important;
     }
-
     [class*="vscode"] div.ag-row-even {
         border: 0px;
         background-color: var(--vscode-editor-background);
     }
-
     [class*="vscode"] div.ag-row-odd {
         border: 0px;
         background-color: var(--vscode-sideBar-background);
     }
-
     [class*="vscode"] div.ag-ltr div.ag-has-focus div.ag-cell-focus:not(div.ag-cell-range-selected) {
         border-color: var(--vscode-editorCursor-foreground);
     }
-
-    /* Styling for the filter pop-up */
-
     [class*="vscode"] div.ag-menu {
         background-color: var(--vscode-notifications-background);
         color: var(--vscode-notifications-foreground);
         border-color: var(--vscode-notifications-border);
     }
-
     [class*="vscode"] div.ag-filter-apply-panel-button {
         background-color: var(--vscode-button-background);
         color: var(--vscode-button-foreground);
@@ -593,13 +611,11 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
         padding: 5px 10px;
         font-size: 12px;
     }
-
     [class*="vscode"] div.ag-picker-field-wrapper {
         background-color: var(--vscode-editor-background);
         color: var(--vscode-editor-foreground);
         border-color: var(--vscode-notificationCenter-border);
     }
-
     [class*="vscode"] input[class^=ag-] {
         border-color: var(--vscode-notificationCenter-border) !important;
     }
@@ -610,6 +626,8 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
     <script>
     
     const vscode = acquireVsCodeApi();
+    let hasReceivedFirstRows = false;
+
     const dateFilterParams = {
         browserDatePicker: true,
         comparator: function (filterLocalDateAtMidnight, cellValue) {
@@ -633,41 +651,60 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
         defaultOption: 'equals',
         filterPlaceholder: '1=TRUE, 0=FALSE...'
     };
-    const data = ${String(content)};
+
+    // Inject raw JSON data from R
+    const data = ${content};
+
+    // NEW: Update loading text with row count
+    function updateRowCount(total, unfiltered = total) {
+        const el = document.getElementById('rowInfo');
+        if (el) {
+            el.textContent = total.toLocaleString() + 
+                (unfiltered > total ? ' of ' + unfiltered.toLocaleString() : '') + ' rows';
+        }
+    }
+
+    // If R already sent totalRows (recommended), show it immediately
+    ${hasTotalRows ? `updateRowCount(${parsedData.totalRows}, ${parsedData.totalUnfiltered || parsedData.totalRows});` : ''}
+
     const displayDataSource = {
         rowCount: undefined,
+        _TotalRows: ${hasTotalRows ? parsedData.totalRows : 0},
+        _TotalUnfiltered: ${hasTotalRows ? (parsedData.totalUnfiltered || parsedData.totalRows) : 0},
         getRows(params) {
+            const msg = {
+                command: 'fetchRows',
+                start: params.startRow,
+                end: params.endRow,
+                sortModel: params.sortModel,
+                filterModel: params.filterModel,
+                requestId: Math.random().toString(36).substr(2, 9)
+            };
+            
+            const handler = event => {
+                const m = event.data;
+                if (m.command === 'fetchedRows' && m.requestId === msg.requestId) {
+            
+                    if (!hasReceivedFirstRows) {
+                        hasReceivedFirstRows = true;
+                        const overlay = document.getElementById('loadingOverlay');
+                        if (overlay) overlay.classList.add('hidden');
+                    }
 
-        const msg = {
-            command:     'fetchRows',
-            start:       params.startRow,
-            end:         params.endRow,
-            sortModel:   params.sortModel,
-            filterModel: params.filterModel,
-            requestId: Math.random().toString(36).substr(2, 9)
-        };
-        
-        const handler = event => {
-            const m = event.data;
-            if (m.command   === 'fetchedRows' && m.requestId === msg.requestId) {
-              
-              displayDataSource._TotalRows = m.totalRows;
-              displayDataSource._TotalUnfiltered = m.totalUnfiltered;
-              
-              displayDataSource.api.refreshHeader();
-              
-              const totalRows = m.totalRows;
-              let lastRow = -1;
-              if (totalRows <= params.endRow) {
-                lastRow = totalRows;
-              }
-              params.successCallback(m.rows, lastRow);
-              window.removeEventListener('message', handler);
-            } 
-        };
-        window.addEventListener('message', handler);
-        vscode.postMessage(msg);
-      }
+                    displayDataSource._TotalRows = m.totalRows;
+                    displayDataSource._TotalUnfiltered = m.totalUnfiltered;
+                    updateRowCount(m.totalRows, m.totalUnfiltered);
+                    displayDataSource.api?.refreshHeader();
+
+                    const totalRows = m.totalRows;
+                    let lastRow = totalRows <= params.endRow ? totalRows : -1;
+                    params.successCallback(m.rows, lastRow);
+                    window.removeEventListener('message', handler);
+                } 
+            };
+            window.addEventListener('message', handler);
+            vscode.postMessage(msg);
+        }
     };
 
     const columnDefs = data.columns.map(col => {
@@ -675,33 +712,24 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
           return {
             ...col,
             valueFormatter: params =>
-              params.value === true 
-              ? 'TRUE'
-              : params.value === false
-                  ? 'FALSE'
-                  : ''
+              params.value === true ? 'TRUE' :
+              params.value === false ? 'FALSE' : ''
           };
         } else if (col.type === "dateColumn") {
-          return {
-            ...col, 
-            width: 200
-          };
+          return { ...col, width: 200 };
         }
       
         if (col.field === "x2") {
-          return {
-            ...col,
-            hide: true
-          };
+          return { ...col, hide: true };
         }
         else if (col.field === "x1") {
           return {
             ...col,
-            sortable:     false,
-            filter:       false,
+            sortable: false,
+            filter: false,
             lockPosition: 'left',
             suppressHeaderMenuButton: true,
-            width:        150,
+            width: 150,
             headerValueGetter: () => {
               const a = displayDataSource._TotalRows || 0;
               const b = displayDataSource._TotalUnfiltered || 0;
@@ -709,8 +737,6 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
             }
           };
         }
-
-        
         return col;
       });
     
@@ -732,9 +758,7 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
         },
         
         columnDefs: columnDefs,
-        getRowId: function(params) {
-            return params.data.x2;
-        },
+        getRowId: params => params.data.x2,
 
         suppressColumnVirtualisation: false,
         alwaysShowVerticalScroll: true,
@@ -743,26 +767,22 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
         ensureDomOrder: true,
         rowHeight: 25,
         rowModelType: 'infinite',
-        cacheBlockSize: 50,
+        cacheBlockSize: 100,                    // Increased from 50
         maxBlocksInCache: 100,
-        infiniteInitialRowCount: 50,
+        infiniteInitialRowCount: 100,           // Show 100 placeholder rows
         cacheOverflowSize: 2,
-        maxConcurrentDatasourceRequests: 2,
+        maxConcurrentDatasourceRequests: 1,     // Critical for performance!
+        blockLoadDebounceMillis: 500,           // Prevent flooding R
         
-        rowBuffer: 5,
-        blockLoadDebounceMillis: 300,
-      
+        rowBuffer: 10,
         rowSelection: 'multiple',
         enableCellTextSelection: true,
         suppressRowTransform: true,
         animateRows: false,
         
-        onSortChanged: function(params) {
+        onSortChanged: params => params.api.purgeInfiniteCache(),
+        onFilterChanged: params => {
             params.api.purgeInfiniteCache();
-        }, 
-        onFilterChanged: function(params) {
-        console.log("onFilterChanged - new filterModel:", params.api.getFilterModel());
-          params.api.purgeInfiniteCache();
         }
       };
     
@@ -776,7 +796,7 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
     }
     
     document.addEventListener('DOMContentLoaded', () => {
-        gridOptions.columnDefs.forEach(function(column) {
+        gridOptions.columnDefs.forEach(column => {
             if (column.type === 'dateColumn') {
                 column.filterParams = dateFilterParams;
             }
@@ -791,46 +811,45 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
         displayDataSource.api = gridApi;        
         gridApi.setGridOption('datasource', displayDataSource);
 
-        const columnsToSize = columnDefs
-            .filter(col => col.field !== 'x1')
-            .map(col => col.field);
-        gridApi.autoSizeColumns(columnsToSize, false);
-        
+        // Auto-size columns early (even before rows)
+        setTimeout(() => {
+            const cols = columnDefs.filter(col => col.field !== 'x1').map(col => col.field);
+            gridApi.autoSizeColumns(cols, false);
+        }, 100);
+
         window.addEventListener('message', event => {
             const msg = event.data;
             if (msg.command === 'refreshDataview') {
+              
+              hasReceivedFirstRows = false;
+              const overlay = document.getElementById('loadingOverlay');
+              if (overlay) overlay.classList.remove('hidden');
 
               gridApi.setFilterModel(null);
               gridApi.onFilterChanged();            
-              gridApi.resetColumnState();      
-
-              const columnsToSize = columnDefs
-                  .filter(col => col.field !== 'x1')
-                  .map(col => col.field);
-              gridApi.autoSizeColumns(columnsToSize, false);
-
               gridApi.purgeInfiniteCache();           
               gridApi.ensureIndexVisible(0, 'top');   
             }
-          });
+        });
     });
-    
     
     function onload() {
         updateTheme();
-        const observer = new MutationObserver(function (event) {
-            updateTheme();
-        });
+        const observer = new MutationObserver(updateTheme);
         observer.observe(document.body, {
             attributes: true,
-            attributeFilter: ['class'],
-            childList: false,
-            characterData: false
+            attributeFilter: ['class']
         });
     }
     </script>
 </head>
 <body onload='onload()'>
+    <!-- NEW: Loading overlay with spinner and row count -->
+    <div id="loadingOverlay">
+        <div class="spinner">⟳</div>
+        <div>Loading data viewer...</div>
+        <div id="rowInfo">Preparing ${parsedData.columns?.length - 2 || 0} columns...</div>
+    </div>
     <div id="myGrid" style="height: 100%;"></div>
 </body>
 </html>
