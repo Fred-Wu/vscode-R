@@ -136,7 +136,7 @@ dataview_table <- local({
         field_map <- setNames(full_cols, fields)
 
         if (metadata_only) {
-            meta_data <- data.table::as.data.table(data[0, ])
+            meta_data <- data.table::as.data.table(data[0, , drop = FALSE])
             meta_data[, `:=`("(row)" = numeric(), rowId = integer())]
             data.table::setcolorder(meta_data, neworder = c("(row)", "rowId"), before = 1)
             columns <- .mapply(
@@ -781,7 +781,7 @@ if (show_view) {
             }
         }
         if (is.data.frame(x) || is.matrix(x)) {
-            x <- data.table::as.data.table(x[0, ])
+            x <- data.table::as.data.table(x[0, , drop = FALSE])
             if (exists(".dataview_first_map", envir = .GlobalEnv, inherits = FALSE)) {
                 fm_env        <- get(".dataview_first_map", envir = .GlobalEnv)
                 fm_env[[title]] <- NULL
