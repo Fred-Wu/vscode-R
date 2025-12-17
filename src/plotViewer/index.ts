@@ -18,6 +18,7 @@ import { FocusPlotMessage, InMessage, OutMessage, ToggleStyleMessage, UpdatePlot
 import { HttpgdIdResponse, HttpgdPlotId, HttpgdRendererId } from 'httpgd/lib/types';
 import { Response } from 'node-fetch';
 import { autoShareBrowser, isHost, shareServer } from '../liveShare';
+import { promises } from 'dns';
 
 const commands = [
     'showViewers',
@@ -58,7 +59,10 @@ export class HttpgdManager {
 
     viewerOptions: HttpgdViewerOptions;
 
-    recentlyActiveViewers: HttpgdViewer[] = [];
+    private recentlyActiveViewers = new Map<string, HttpgdViewer[]>();
+    
+    private static readonly MANUAL_PID = '__manual__';
+    private static readonly GUEST_PID = '__guest__';
 
     constructor() {
         const htmlRoot = extensionContext.asAbsolutePath('html/httpgd');
@@ -69,17 +73,18 @@ export class HttpgdManager {
         };
     }
 
-    public async showViewer(urlString: string): Promise<void> {
+    public async showViewer(urlString: string, pid: string): Promise<void> {
         const url = new URL(urlString);
         const host = url.host;
         const token = url.searchParams.get('token') || undefined;
+        const viewers = this.recentlyActiveViewers.get(pid) ?? [];
         const ind = this.viewers.findIndex(
             (viewer) => viewer.host === host
         );
         if (ind >= 0) {
             const viewer = this.viewers.splice(ind, 1)[0];
             this.viewers.unshift(viewer);
-            viewer.show();
+            viewer.show(true);
         } else {
             const conf = config();
             const colorTheme = conf.get('plot.defaults.colorTheme', 'vscode');
@@ -89,25 +94,30 @@ export class HttpgdManager {
             this.viewerOptions.resizeTimeoutLength = conf.get('plot.timing.resizeInterval', 100);
             this.viewerOptions.fullWindow = conf.get('plot.defaults.fullWindowMode', false);
             this.viewerOptions.token = token;
-            const viewer = new HttpgdViewer(host, this.viewerOptions);
+            const viewer = new HttpgdViewer(host, this.viewerOptions, pid);
+            viewers.unshift(viewer);
+            
+            viewer.webviewPanel?.onDidDispose(() => {
+            });
+            
             if (isHost() && autoShareBrowser) {
                 const disposable = await shareServer(url, 'httpgd');
                 viewer.webviewPanel?.onDidDispose(() => void disposable.dispose());
             }
-            this.viewers.unshift(viewer);
         }
+        this.recentlyActiveViewers.set(pid, viewers);
     }
 
     public registerActiveViewer(viewer: HttpgdViewer): void {
-        const ind = this.recentlyActiveViewers.indexOf(viewer);
-        if (ind) {
-            this.recentlyActiveViewers.splice(ind, 1);
+        const ind = this.viewers.indexOf(viewer);
+        if (ind >= 0) {
+            this.viewers.splice(ind, 1);
         }
-        this.recentlyActiveViewers.unshift(viewer);
+        this.viewers.unshift(viewer);
     }
 
     public getRecentViewer(): HttpgdViewer | undefined {
-        return this.recentlyActiveViewers.find((viewer) => !!viewer.webviewPanel);
+        return this.viewers.find((viewer) => !!viewer.webviewPanel);
     }
 
     public getNewestViewer(): HttpgdViewer | undefined {
@@ -129,8 +139,25 @@ export class HttpgdManager {
         };
         const urlString = await vscode.window.showInputBox(options);
         if (urlString) {
-            await this.showViewer(urlString);
+            await this.showViewer(urlString, HttpgdManager.MANUAL_PID);
         }
+    }
+    
+    public async showGuestViewer(urlString: string): Promise<void> {
+      await this.showViewer(urlString, HttpgdManager.GUEST_PID);
+    }
+    
+    public hasViewer(pid: string): boolean {
+      const viewers = this.recentlyActiveViewers.get(pid);
+      return !!viewers && viewers.some(v => v.webviewPanel);
+    }
+    
+    public dropPid(pid: string): void {
+        const viewers = this.recentlyActiveViewers.get(pid);
+        if (!viewers) return;
+        
+        viewers.forEach(v => v.webviewPanel?.dispose());
+        this.recentlyActiveViewers.delete(pid);
     }
 
     // generic command handler
@@ -143,9 +170,9 @@ export class HttpgdManager {
         //
 
         if (command === 'showViewers') {
-            this.viewers.forEach(viewer => {
-                viewer.show(true);
-            });
+           for (const viewers of this.recentlyActiveViewers.values()) {
+                viewers.forEach(v => v.show(true));
+            };
             return;
         } else if (command === 'openUrl') {
             void this.openUrl();
@@ -310,6 +337,8 @@ export class HttpgdViewer implements IHttpgdViewer {
 
     readonly showOptions: ShowOptions;
     readonly webviewOptions: vscode.WebviewPanelOptions & vscode.WebviewOptions;
+    
+    private pid?: string;
 
     // Computed properties:
 
@@ -332,10 +361,11 @@ export class HttpgdViewer implements IHttpgdViewer {
 
     // constructor called by the session watcher if a corresponding function was called in R
     // creates a new api instance itself
-    constructor(host: string, options: HttpgdViewerOptions) {
+    constructor(host: string, options: HttpgdViewerOptions, pid?: string) {
         this.host = host;
         this.token = options.token;
         this.parent = options.parent;
+        this.pid = pid;
 
         this.api = new Httpgd(this.host, this.token, true);
         this.api.onPlotsChanged((newState) => {
@@ -391,7 +421,7 @@ export class HttpgdViewer implements IHttpgdViewer {
                 ...this.showOptions,
                 preserveFocus: preserveFocus
             };
-            this.webviewPanel = this.makeNewWebview(showOptions);
+            this.webviewPanel = this.makeNewWebview(showOptions, this.pid);
             this.refreshHtml();
         } else {
             this.webviewPanel.reveal(undefined, preserveFocus);
@@ -674,7 +704,7 @@ export class HttpgdViewer implements IHttpgdViewer {
     // functions for initial or re-drawing of html:
 
     protected refreshHtml(): void {
-        this.webviewPanel ??= this.makeNewWebview();
+        this.webviewPanel ??= this.makeNewWebview(undefined, this.pid);
         this.webviewPanel.webview.html = '';
         this.webviewPanel.webview.html = this.makeHtml();
         // make sure that fullWindow is set correctly:
@@ -726,10 +756,14 @@ export class HttpgdViewer implements IHttpgdViewer {
         return ejsData;
     }
 
-    protected makeNewWebview(showOptions?: ShowOptions): vscode.WebviewPanel {
+    protected makeNewWebview(
+      showOptions?: ShowOptions,
+      titleSuffix?: string
+    ): vscode.WebviewPanel {
+        const title = titleSuffix ? `R Plot (${titleSuffix})` : 'R Plot';
         const webviewPanel = vscode.window.createWebviewPanel(
             'RPlot',
-            'R Plot',
+            title,
             showOptions || this.showOptions,
             this.webviewOptions
         );

@@ -1049,8 +1049,9 @@ async function updateRequest(sessionStatusBarItem: StatusBarItem) {
                         break;
                     }
                     case 'httpgd': {
+                        pid = String(request.pid);
                         if (request.url) {
-                            await globalHttpgdManager?.showViewer(request.url);
+                            await globalHttpgdManager?.showViewer(request.url, pid);
                         }
                         break;
                     }
@@ -1078,9 +1079,12 @@ async function updateRequest(sessionStatusBarItem: StatusBarItem) {
                         purgeAddinPickerItems();
                         await setContext('rSessionActive', true);
                         if (request.plot_url) {
-                            await globalHttpgdManager?.showViewer(request.plot_url);
+                            if (!globalHttpgdManager?.hasViewer(pid)) {
+                                await globalHttpgdManager?.showViewer(request.plot_url, pid);
+                            }
                         }
                         void watchProcess(pid).then((v: string) => {
+                            globalHttpgdManager?.dropPid(v);
                             void cleanupSession(v);
                         });
                         break;

@@ -118,8 +118,9 @@ export async function updateGuestRequest(file: string, force: boolean = false): 
                 break;
             }
             case 'httpgd': {
+                guestPid = String(request.pid);
                 if (request.url) {
-                    await globalHttpgdManager?.showViewer(request.url);
+                    await globalHttpgdManager?.showViewer(request.url, guestPid);
                 }
                 break;
             }
