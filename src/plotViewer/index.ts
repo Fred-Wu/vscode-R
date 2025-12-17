@@ -18,7 +18,6 @@ import { FocusPlotMessage, InMessage, OutMessage, ToggleStyleMessage, UpdatePlot
 import { HttpgdIdResponse, HttpgdPlotId, HttpgdRendererId } from 'httpgd/lib/types';
 import { Response } from 'node-fetch';
 import { autoShareBrowser, isHost, shareServer } from '../liveShare';
-import { promises } from 'dns';
 
 const commands = [
     'showViewers',
