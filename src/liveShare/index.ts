@@ -8,13 +8,13 @@ import * as vscode from 'vscode';
 import * as vsls from 'vsls';
 import * as fs from 'fs-extra';
 
-import { enableSessionWatcher, extensionContext } from '../extension';
-import { attachActiveGuest, browserDisposables, initGuest } from './shareSession';
+import { enableSessionWatcher, extensionContext, globalHttpgdManager } from '../extension';
+import { attachActiveGuest, browserDisposables, initGuest, shareServer } from './shareSession';
 import { initTreeView, rLiveShareProvider, shareWorkspace, ToggleNode } from './shareTree';
 import { Commands, Callback, liveShareOnRequest, liveShareRequest } from './shareCommands';
 
 import { HelpFile } from '../helpViewer';
-import { WorkspaceData, workspaceData } from '../session';
+import { WorkspaceData, workspaceData, requestFile } from '../session';
 import { config } from '../util';
 
 /// LiveShare
@@ -23,6 +23,7 @@ export let rGuestService: GuestService | undefined = undefined;
 export let liveSession: vsls.LiveShare;
 export let isGuestSession: boolean;
 export let _sessionStatusBarItem: vscode.StatusBarItem;
+let guestCommandRegistered: boolean = false;
 
 // service vars
 export const ShareProviderName = 'vscode-r';
@@ -89,12 +90,39 @@ export async function initLiveShare(context: vscode.ExtensionContext): Promise<v
                         await LiveSessionListener();
                         rLiveShareProvider.refresh();
                     }
+                ),
+                vscode.commands.registerCommand(
+                    'r.liveShare.reshareHttpgd', async () => {
+                        if (!isLiveShare() || !isHost()) {
+                            void vscode.window.showWarningMessage('No active Live Share host session.');
+                            return;
+                        }
+                        const urlString = globalHttpgdManager?.getLastPlotUrl();
+                        if (!urlString) {
+                            void vscode.window.showWarningMessage('No httpgd server available to share.');
+                            return;
+                        }
+                        const shareName = 'httpgd';
+                        try {
+                            globalHttpgdManager?.disposeSharedServer(urlString);
+                            const url = new URL(urlString);
+                            const disposable = await shareServer(url, shareName);
+                            globalHttpgdManager?.trackSharedServer(urlString, disposable);
+                            rHostService?.notifyGuestPlotManager(urlString);
+                        } catch (error) {
+                            console.error('[r.liveShare.reshareHttpgd] failed to share server', error);
+                            void vscode.window.showErrorMessage('Failed to share httpgd server.');
+                        }
+                    }
                 )
             );
         } else {
-            context.subscriptions.push(
-                vscode.commands.registerCommand('r.attachActiveGuest', () => attachActiveGuest())
-            );
+            if (!guestCommandRegistered) {
+                context.subscriptions.push(
+                    vscode.commands.registerCommand('r.attachActiveGuest', () => attachActiveGuest())
+                );
+                guestCommandRegistered = true;
+            }
         }
     }
 }
@@ -132,6 +160,18 @@ export async function LiveSessionListener(): Promise<void> {
     liveSession = liveSessionStatus as vsls.LiveShare;
     console.log('[LiveSessionListener] started');
 
+    liveSession.onDidChangePeers((e: vsls.PeersChangeEvent) => {
+        if (liveSession.session.role !== vsls.Role.Host) {
+            return;
+        }
+        if (e.added.length === 0) {
+            return;
+        }
+        if (requestFile && shareWorkspace) {
+            rHostService?.notifyRequest(requestFile, true);
+        }
+    }, null, extensionContext.subscriptions);
+
     // When the session state changes, attempt to
     // start a liveSession service, which is responsible
     // for providing session-watcher functionality
@@ -144,11 +184,27 @@ export async function LiveSessionListener(): Promise<void> {
                 break;
             case vsls.Role.Guest:
                 console.log('[LiveSessionListener] guest event');
+                isGuestSession = true;
+                void vscode.commands.executeCommand('setContext', 'r.liveShare:isGuest', true);
+                if (!_sessionStatusBarItem) {
+                    initGuest(extensionContext);
+                }
+                if (!guestCommandRegistered) {
+                    extensionContext.subscriptions.push(
+                        vscode.commands.registerCommand('r.attachActiveGuest', () => attachActiveGuest())
+                    );
+                    guestCommandRegistered = true;
+                }
                 await rGuestService?.startService();
                 break;
             case vsls.Role.Host:
                 console.log('[LiveSessionListener] host event');
+                isGuestSession = false;
+                void vscode.commands.executeCommand('setContext', 'r.liveShare:isGuest', false);
                 await rHostService?.startService();
+                if (requestFile && shareWorkspace) {
+                    rHostService?.notifyRequest(requestFile, true);
+                }
                 rLiveShareProvider.refresh();
                 break;
             default:
@@ -165,11 +221,27 @@ export async function LiveSessionListener(): Promise<void> {
             break;
         case vsls.Role.Guest:
             console.log('[LiveSessionListener] guest event');
+            isGuestSession = true;
+            void vscode.commands.executeCommand('setContext', 'r.liveShare:isGuest', true);
+            if (!_sessionStatusBarItem) {
+                initGuest(extensionContext);
+            }
+            if (!guestCommandRegistered) {
+                extensionContext.subscriptions.push(
+                    vscode.commands.registerCommand('r.attachActiveGuest', () => attachActiveGuest())
+                );
+                guestCommandRegistered = true;
+            }
             await rGuestService.startService();
             break;
         default:
             console.log('[LiveSessionListener] host event');
+            isGuestSession = false;
+            void vscode.commands.executeCommand('setContext', 'r.liveShare:isGuest', false);
             await rHostService.startService();
+            if (requestFile && shareWorkspace) {
+                rHostService?.notifyRequest(requestFile, true);
+            }
             break;
     }
 }
@@ -259,7 +331,6 @@ export class GuestService {
         service = await liveSession.getSharedService(ShareProviderName);
         if (service) {
             this._isStarted = true;
-            this.requestAttach();
             for (const command in Commands.guest) {
                 void liveShareOnRequest(command, Commands.guest[command], service);
                 console.log(`[GuestService] added ${command} callback`);
@@ -298,6 +369,12 @@ export class GuestService {
         if (this._isStarted) {
             void liveShareRequest(Callback.RequestRunTextInTerm, text);
         }
+    }
+    public async requestDataViewRows(args: unknown): Promise<unknown> {
+        if (this._isStarted) {
+            return liveShareRequest(Callback.RequestDataViewRows, args);
+        }
+        return undefined;
     }
     // The session watcher relies on files for providing many functions to vscode-R.
     // As LiveShare does not allow for exposing files outside a given workspace,

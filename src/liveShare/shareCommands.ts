@@ -3,11 +3,11 @@ import * as vscode from 'vscode';
 import * as fs from 'fs-extra';
 
 import { rHostService, isGuest, service } from '.';
-import { updateGuestRequest, updateGuestWorkspace, updateGuestPlot, detachGuest } from './shareSession';
+import { updateGuestRequest, updateGuestWorkspace, updateGuestPlot, detachGuest, clearGuestAttachRequested } from './shareSession';
 import { forwardCommands, shareWorkspace } from './shareTree';
 
 import { runTextInTerm } from '../rTerminal';
-import { requestFile, WorkspaceData } from '../session';
+import { requestFile, WorkspaceData, sessionRequest, server } from '../session';
 import { HelpFile } from '../helpViewer';
 import { globalHttpgdManager, globalRHelp } from '../extension';
 
@@ -28,6 +28,13 @@ interface ICommands {
     }
 }
 
+function normalizeRequestArgs<T>(args: T[] | unknown): T[] {
+    const list = Array.isArray(args) ? args : [args];
+    const first = list[0] as { connection?: unknown; session?: unknown } | undefined;
+    const hasContext = first && typeof first === 'object' && 'connection' in first && 'session' in first;
+    return (hasContext ? list.slice(1) : list) as T[];
+}
+
 // used for notify & request events
 // (mainly to prevent typos)
 export const enum Callback {
@@ -37,6 +44,7 @@ export const enum Callback {
     NotifyMessage = 'NotifyMessage',
     RequestAttachGuest = 'RequestAttachGuest',
     RequestRunTextInTerm = 'RequestRunTextInTerm',
+    RequestDataViewRows = 'RequestDataViewRows',
     GetFileContent = 'GetFileContent',
     OrderDetach = 'OrderDetach',
     GetHelpFileContent = 'GetHelpFileContent',
@@ -62,30 +70,46 @@ export const Commands: ICommands = {
         // Command arguments are sent from the guest to the host,
         // and then the host sends the arguments to the console
         [Callback.RequestAttachGuest]: (): void => {
-            if (shareWorkspace && rHostService) {
-                void rHostService.notifyRequest(requestFile, true);
-            } else {
+            if (!shareWorkspace || !rHostService) {
                 void liveShareRequest(Callback.NotifyMessage, 'The host has not enabled guest attach.', MessageType.warning);
+                return;
             }
+            if (!server) {
+                void liveShareRequest(Callback.NotifyMessage, 'No active host session to attach.', MessageType.warning);
+                return;
+            }
+            void runTextInTerm('.vsc.attach()');
         },
-        [Callback.RequestRunTextInTerm]: (args: [text: string]): void => {
+        [Callback.RequestRunTextInTerm]: (args: [text: string] | unknown): void => {
             if (forwardCommands) {
-                void runTextInTerm(`${args[0]}`);
+                const params = normalizeRequestArgs<string>(args);
+                void runTextInTerm(`${params[0]}`);
             } else {
                 void liveShareRequest(Callback.NotifyMessage, 'The host has not enabled command forwarding. Command was not sent.', MessageType.warning);
             }
 
         },
-        [Callback.GetHelpFileContent]: (args: [text: string]): Promise<HelpFile | undefined> | undefined => {
-            return globalRHelp?.getHelpFileForPath(args[0]);
+        [Callback.GetHelpFileContent]: (args: [text: string] | unknown): Promise<HelpFile | undefined> | undefined => {
+            const params = normalizeRequestArgs<string>(args);
+            return globalRHelp?.getHelpFileForPath(params[0]);
+        },
+        [Callback.RequestDataViewRows]: async (args: unknown): Promise<unknown> => {
+            const params = normalizeRequestArgs<unknown>(args);
+            if (!server) {
+                throw new Error('R server not available');
+            }
+            return sessionRequest(server, params[0]);
         },
         /// File Handling ///
         // Host reads content from file, then passes the content
         // to the guest session.
-        [Callback.GetFileContent]: async (args: [text: string, encoding?: string]): Promise<string | Buffer> => {
-            return args[1] !== undefined ?
-                await fs.readFile(args[0], args[1]) :
-                await fs.readFile(args[0]);
+        [Callback.GetFileContent]: async (args: [text: string, encoding?: string] | unknown): Promise<string | Buffer> => {
+            const params = normalizeRequestArgs<unknown>(args);
+            const file = params[0] as string;
+            const encoding = params[1] as string | undefined;
+            return encoding !== undefined ?
+                await fs.readFile(file, encoding) :
+                await fs.readFile(file);
         }
     },
     'guest': {
@@ -110,6 +134,10 @@ export const Commands: ICommands = {
         // This way, we don't have to do much error checking on the guests side, which is more secure
         // and less prone to error
         [Callback.NotifyMessage]: (args: [text: string, messageType: MessageType]): void => {
+            if (args[0] === 'No active host session to attach.'
+                || args[0] === 'The host has not enabled guest attach.') {
+                clearGuestAttachRequested();
+            }
             switch (args[1]) {
                 case MessageType.error:
                     return void vscode.window.showErrorMessage(args[0]);
