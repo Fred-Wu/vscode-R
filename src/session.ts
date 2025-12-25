@@ -5,7 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { Agent } from 'http';
 import fetch from 'node-fetch';
-import { commands, StatusBarItem, Uri, ViewColumn, Webview, window, workspace, env, WebviewPanelOnDidChangeViewStateEvent, WebviewPanel } from 'vscode';
+import { commands, StatusBarItem, Uri, ViewColumn, Webview, window, workspace, env, WebviewPanelOnDidChangeViewStateEvent, WebviewPanel, Tab } from 'vscode';
 
 import { runTextInTerm } from './rTerminal';
 import { FSWatcher } from 'fs-extra';
@@ -92,6 +92,45 @@ export function disposeDataViewPanels(): void {
     dataviewPanels.clear();
 }
 
+async function closeSessionViewers(options?: { includeHelp?: boolean }): Promise<void> {
+    const includeHelp = options?.includeHelp ?? false;
+    const tabsToClose: Tab[] = [];
+    for (const group of window.tabGroups.all) {
+        for (const tab of group.tabs) {
+            const input = tab.input as { viewType?: string } | undefined;
+            const viewType = input?.viewType;
+            const normalizedViewType = viewType?.split('-').pop()?.toLowerCase();
+            if (
+                normalizedViewType === 'dataview' ||
+                normalizedViewType === 'rplot' ||
+                (includeHelp && normalizedViewType === 'rhelp')
+            ) {
+                tabsToClose.push(tab);
+            }
+        }
+    }
+    if (tabsToClose.length) {
+        await window.tabGroups.close(tabsToClose, true);
+    }
+}
+
+let tabCleanupDisposable: { dispose(): void } | undefined;
+
+function scheduleSessionViewerCleanup(): void {
+    if (tabCleanupDisposable || isLiveShare()) {
+        return;
+    }
+    tabCleanupDisposable = window.tabGroups.onDidChangeTabs(() => {
+        if (pid) {
+            tabCleanupDisposable?.dispose();
+            tabCleanupDisposable = undefined;
+            return;
+        }
+        void closeSessionViewers({ includeHelp: true });
+    });
+    void closeSessionViewers({ includeHelp: true });
+}
+
 export function deploySessionWatcher(extensionPath: string): void {
     console.info(`[deploySessionWatcher] extensionPath: ${extensionPath}`);
     resDir = path.join(extensionPath, 'dist', 'resources');
@@ -109,6 +148,9 @@ export function deploySessionWatcher(extensionPath: string): void {
 }
 
 export function startRequestWatcher(sessionStatusBarItem: StatusBarItem): void {
+    if (!isLiveShare()) {
+        scheduleSessionViewerCleanup();
+    }
     console.info('[startRequestWatcher] Starting');
     requestFile = path.join(homeExtDir(), 'request.log');
     requestLockFile = path.join(homeExtDir(), 'request.lock');
@@ -1157,6 +1199,9 @@ export async function cleanupSession(pidArg: string): Promise<void> {
         globalHttpgdManager?.dropPid(pid);
         globalHttpgdManager?.clearLastPlot();
         disposeDataViewPanels();
+        if (!isLiveShare()) {
+            await closeSessionViewers();
+        }
         globalHttpgdManager?.disposeSharedServers();
         if (isLiveShare()) {
             while (browserDisposables.length > 0) {
