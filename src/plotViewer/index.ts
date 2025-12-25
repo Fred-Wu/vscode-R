@@ -10,14 +10,15 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as ejs from 'ejs';
 
-import { asViewColumn, config, setContext, UriIcon, makeWebviewCommandUriString } from '../util';
+import { asViewColumn, config, readContent, setContext, UriIcon, makeWebviewCommandUriString } from '../util';
 
 import { extensionContext } from '../extension';
 
 import { FocusPlotMessage, InMessage, OutMessage, ToggleStyleMessage, UpdatePlotMessage, HidePlotMessage, AddPlotMessage, PreviewPlotLayout, PreviewPlotLayoutMessage, ToggleFullWindowMessage } from './webviewMessages';
 import { HttpgdIdResponse, HttpgdPlotId, HttpgdRendererId } from 'httpgd/lib/types';
 import { Response } from 'node-fetch';
-import { autoShareBrowser, isHost, shareServer } from '../liveShare';
+import { autoShareBrowser, isGuest, isHost, rHostService, shareServer } from '../liveShare';
+import { requestFile, server } from '../session';
 
 const commands = [
     'showViewers',
@@ -59,6 +60,10 @@ export class HttpgdManager {
     viewerOptions: HttpgdViewerOptions;
 
     private recentlyActiveViewers = new Map<string, HttpgdViewer[]>();
+    private sharedServers = new Map<string, vscode.Disposable>();
+
+    private lastPlotUrl?: string;
+    private lastPlotPid?: string;
     
     private static readonly MANUAL_PID = '__manual__';
     private static readonly GUEST_PID = '__guest__';
@@ -73,17 +78,36 @@ export class HttpgdManager {
     }
 
     public async showViewer(urlString: string, pid: string): Promise<void> {
+        this.lastPlotUrl = urlString;
+        this.lastPlotPid = pid;
         const url = new URL(urlString);
         const host = url.host;
         const token = url.searchParams.get('token') || undefined;
         const viewers = this.recentlyActiveViewers.get(pid) ?? [];
+        const existingPidViewer = viewers.find((viewer) => viewer.host === host);
         const ind = this.viewers.findIndex(
             (viewer) => viewer.host === host
         );
-        if (ind >= 0) {
+        if (existingPidViewer) {
+            const existingIndex = this.viewers.indexOf(existingPidViewer);
+            if (existingIndex >= 0) {
+                this.viewers.splice(existingIndex, 1);
+            }
+            this.viewers.unshift(existingPidViewer);
+            existingPidViewer.show(true);
+            if (pid === HttpgdManager.GUEST_PID) {
+                void existingPidViewer.reconnect();
+            }
+        } else if (ind >= 0) {
             const viewer = this.viewers.splice(ind, 1)[0];
             this.viewers.unshift(viewer);
             viewer.show(true);
+            if (pid === HttpgdManager.GUEST_PID) {
+                void viewer.reconnect();
+            }
+            if (!viewers.includes(viewer)) {
+                viewers.unshift(viewer);
+            }
         } else {
             const conf = config();
             const colorTheme = conf.get('plot.defaults.colorTheme', 'vscode');
@@ -100,8 +124,13 @@ export class HttpgdManager {
             });
             
             if (isHost() && autoShareBrowser) {
-                const disposable = await shareServer(url, 'httpgd');
-                viewer.webviewPanel?.onDidDispose(() => void disposable.dispose());
+                try {
+                    const disposable = await shareServer(url, 'httpgd');
+                    rHostService?.notifyGuestPlotManager(urlString);
+                    this.trackSharedServer(urlString, disposable);
+                } catch (error) {
+                    console.error('[HttpgdManager] shareServer failed', error);
+                }
             }
         }
         this.recentlyActiveViewers.set(pid, viewers);
@@ -127,6 +156,72 @@ export class HttpgdManager {
         return (...args: any[]) => {
             this.handleCommand(command, ...args);
         };
+    }
+
+    public setLastPlot(urlString: string, pid: string): void {
+        this.lastPlotUrl = urlString;
+        this.lastPlotPid = pid;
+    }
+
+    public getLastPlotUrl(): string | undefined {
+        return this.lastPlotUrl;
+    }
+
+    public clearLastPlot(): void {
+        this.lastPlotUrl = undefined;
+        this.lastPlotPid = undefined;
+    }
+
+    public closeGuestViewers(): void {
+        this.dropPid(HttpgdManager.GUEST_PID);
+        if (this.lastPlotPid === HttpgdManager.GUEST_PID) {
+            this.lastPlotUrl = undefined;
+            this.lastPlotPid = undefined;
+        }
+    }
+
+    private normalizeSharedKey(urlString: string): string {
+        try {
+            return new URL(urlString).host;
+        } catch {
+            try {
+                return new URL(`http://${urlString}`).host;
+            } catch {
+                return urlString;
+            }
+        }
+    }
+
+    public trackSharedServer(urlString: string, disposable: vscode.Disposable): void {
+        const key = this.normalizeSharedKey(urlString);
+        const existing = this.sharedServers.get(key);
+        if (existing) {
+            existing.dispose();
+        }
+        const originalDispose = disposable.dispose.bind(disposable);
+        disposable.dispose = () => {
+            try {
+                originalDispose();
+            } finally {
+                this.sharedServers.delete(key);
+            }
+        };
+        this.sharedServers.set(key, disposable);
+    }
+
+    public disposeSharedServer(urlString: string): void {
+        const key = this.normalizeSharedKey(urlString);
+        const existing = this.sharedServers.get(key);
+        if (existing) {
+            existing.dispose();
+        }
+    }
+
+    public disposeSharedServers(): void {
+        for (const disposable of this.sharedServers.values()) {
+            disposable.dispose();
+        }
+        this.sharedServers.clear();
     }
 
     public async openUrl(): Promise<void> {
@@ -169,9 +264,62 @@ export class HttpgdManager {
         //
 
         if (command === 'showViewers') {
-           for (const viewers of this.recentlyActiveViewers.values()) {
-                viewers.forEach(v => v.show(true));
-            };
+            void (async () => {
+                if (!server && !isGuest()) {
+                    for (const viewers of this.recentlyActiveViewers.values()) {
+                        viewers.forEach(v => v.show(true));
+                    }
+                    return;
+                }
+                if (this.recentlyActiveViewers.size === 0 && requestFile) {
+                    const requestContent = await readContent(requestFile, 'utf8');
+                    if (typeof requestContent === 'string') {
+                        try {
+                            const request = JSON.parse(requestContent) as { plot_url?: string; pid?: string };
+                            if (request.plot_url && request.pid) {
+                                const url = new URL(request.plot_url);
+                                const token = url.searchParams.get('token') || undefined;
+                                const probe = new Httpgd(url.host, token, true);
+                                try {
+                                    await probe.connect();
+                                } catch {
+                                    void vscode.window.showWarningMessage('No active shared plot server.');
+                                    return;
+                                } finally {
+                                    probe.disconnect();
+                                }
+                                await this.showViewer(request.plot_url, String(request.pid));
+                                return;
+                            }
+                        } catch {
+                            // Ignore malformed request content.
+                        }
+                    }
+                }
+                if (this.recentlyActiveViewers.size === 0 && this.lastPlotUrl && this.lastPlotPid) {
+                    try {
+                        const url = new URL(this.lastPlotUrl);
+                        const token = url.searchParams.get('token') || undefined;
+                        const probe = new Httpgd(url.host, token, true);
+                        try {
+                            await probe.connect();
+                        } catch {
+                            void vscode.window.showWarningMessage('No active shared plot server.');
+                            return;
+                        } finally {
+                            probe.disconnect();
+                        }
+                    } catch {
+                        void vscode.window.showWarningMessage('No active shared plot server.');
+                        return;
+                    }
+                    await this.showViewer(this.lastPlotUrl, this.lastPlotPid);
+                    return;
+                }
+                for (const viewers of this.recentlyActiveViewers.values()) {
+                    viewers.forEach(v => v.show(true));
+                }
+            })();
             return;
         } else if (command === 'openUrl') {
             void this.openUrl();
@@ -338,6 +486,7 @@ export class HttpgdViewer implements IHttpgdViewer {
     readonly webviewOptions: vscode.WebviewPanelOptions & vscode.WebviewOptions;
     
     private pid?: string;
+    private guestConnectionTimer?: NodeJS.Timeout;
 
     // Computed properties:
 
@@ -405,9 +554,28 @@ export class HttpgdViewer implements IHttpgdViewer {
         this.resizeTimeoutLength = options.refreshTimeoutLength ?? this.resizeTimeoutLength;
         this.refreshTimeoutLength = options.refreshTimeoutLength ?? this.refreshTimeoutLength;
         void this.api.connect();
+        this.startGuestHeartbeat();
         //void this.checkState();
     }
 
+    private startGuestHeartbeat(): void {
+        if (!isGuest() || this.guestConnectionTimer) {
+            return;
+        }
+        this.guestConnectionTimer = setInterval(async () => {
+            try {
+                await this.api.updatePlots();
+            } catch (error) {
+                console.error('[HttpgdViewer] guest connection lost', error);
+                if (this.guestConnectionTimer) {
+                    clearInterval(this.guestConnectionTimer);
+                    this.guestConnectionTimer = undefined;
+                }
+                this.dispose();
+                this.parent.dropPid(this.pid ?? '__guest__');
+            }
+        }, 5000);
+    }
 
     // Methods to interact with the webview
     // Can e.g. be called by vscode commands + menu items:
@@ -426,6 +594,17 @@ export class HttpgdViewer implements IHttpgdViewer {
             this.webviewPanel.reveal(undefined, preserveFocus);
         }
         this.parent.registerActiveViewer(this);
+        this.startGuestHeartbeat();
+    }
+
+    public async reconnect(): Promise<void> {
+        try {
+            this.api.disconnect();
+            await this.api.connect();
+            this.startGuestHeartbeat();
+        } catch (error) {
+            console.error('[HttpgdViewer] reconnect failed', error);
+        }
     }
 
     public openExternal(): void {
@@ -767,7 +946,13 @@ export class HttpgdViewer implements IHttpgdViewer {
             this.webviewOptions
         );
         webviewPanel.iconPath = new UriIcon('graph');
-        webviewPanel.onDidDispose(() => this.webviewPanel = undefined);
+        webviewPanel.onDidDispose(() => {
+            if (this.guestConnectionTimer) {
+                clearInterval(this.guestConnectionTimer);
+                this.guestConnectionTimer = undefined;
+            }
+            this.webviewPanel = undefined;
+        });
         webviewPanel.onDidChangeViewState(() => {
             void this.setContextValues();
         });
@@ -880,6 +1065,10 @@ export class HttpgdViewer implements IHttpgdViewer {
     // Dispose-function to clean up when vscode closes
     // E.g. to close connections etc., notify R, ...
     public dispose(): void {
+        if (this.guestConnectionTimer) {
+            clearInterval(this.guestConnectionTimer);
+            this.guestConnectionTimer = undefined;
+        }
         this.api.disconnect();
     }
 }

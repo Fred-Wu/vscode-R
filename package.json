@@ -2,7 +2,7 @@
   "name": "r",
   "displayName": "R",
   "description": "R Extension for Visual Studio Code",
-  "version": "3.0.3",
+  "version": "3.0.4",
   "author": "REditorSupport",
   "license": "SEE LICENSE IN LICENSE",
   "publisher": "REditorSupport",
@@ -695,6 +695,13 @@
         "title": "Retry connection to Live Share service",
         "category": "R Live Share",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "r.liveShare.reshareHttpgd",
+        "title": "Re-share plot server (httpgd)",
+        "category": "R Live Share",
+        "enablement": "r.liveShare:isGuest == false",
+        "icon": "$(cloud-upload)"
       },
       {
         "title": "Toggle Style",

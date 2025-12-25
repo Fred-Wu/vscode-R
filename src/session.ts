@@ -5,7 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { Agent } from 'http';
 import fetch from 'node-fetch';
-import { commands, StatusBarItem, Uri, ViewColumn, Webview, window, workspace, env, WebviewPanelOnDidChangeViewStateEvent, WebviewPanel } from 'vscode';
+import { commands, StatusBarItem, Uri, ViewColumn, Webview, window, workspace, env, WebviewPanelOnDidChangeViewStateEvent, WebviewPanel, Tab } from 'vscode';
 
 import { runTextInTerm } from './rTerminal';
 import { FSWatcher } from 'fs-extra';
@@ -14,7 +14,7 @@ import { purgeAddinPickerItems, dispatchRStudioAPICall } from './rstudioapi';
 
 import { IRequest } from './liveShare/shareSession';
 import { homeExtDir, rWorkspace, globalRHelp, globalHttpgdManager, extensionContext, sessionStatusBarItem } from './extension';
-import { UUID, rHostService, rGuestService, isLiveShare, isHost, isGuestSession, closeBrowser, guestResDir, shareBrowser, openVirtualDoc, shareWorkspace } from './liveShare';
+import { UUID, rHostService, rGuestService, isLiveShare, isHost, isGuestSession, closeBrowser, browserDisposables, guestResDir, shareBrowser, openVirtualDoc, shareWorkspace } from './liveShare';
 
 
 export interface GlobalEnv {
@@ -81,6 +81,56 @@ let activeBrowserExternalUri: Uri | undefined;
 // Add a map to track dataview panels by UUID
 const dataviewPanels = new Map<string, WebviewPanel>();
 
+export function disposeDataViewPanels(): void {
+    for (const panel of dataviewPanels.values()) {
+        try {
+            panel.dispose();
+        } catch (error) {
+            console.error('[disposeDataViewPanels] dispose failed', error);
+        }
+    }
+    dataviewPanels.clear();
+}
+
+async function closeSessionViewers(options?: { includeHelp?: boolean }): Promise<void> {
+    const includeHelp = options?.includeHelp ?? false;
+    const tabsToClose: Tab[] = [];
+    for (const group of window.tabGroups.all) {
+        for (const tab of group.tabs) {
+            const input = tab.input as { viewType?: string } | undefined;
+            const viewType = input?.viewType;
+            const normalizedViewType = viewType?.split('-').pop()?.toLowerCase();
+            if (
+                normalizedViewType === 'dataview' ||
+                normalizedViewType === 'rplot' ||
+                (includeHelp && normalizedViewType === 'rhelp')
+            ) {
+                tabsToClose.push(tab);
+            }
+        }
+    }
+    if (tabsToClose.length) {
+        await window.tabGroups.close(tabsToClose, true);
+    }
+}
+
+let tabCleanupDisposable: { dispose(): void } | undefined;
+
+function scheduleSessionViewerCleanup(): void {
+    if (tabCleanupDisposable || isLiveShare()) {
+        return;
+    }
+    tabCleanupDisposable = window.tabGroups.onDidChangeTabs(() => {
+        if (pid) {
+            tabCleanupDisposable?.dispose();
+            tabCleanupDisposable = undefined;
+            return;
+        }
+        void closeSessionViewers({ includeHelp: true });
+    });
+    void closeSessionViewers({ includeHelp: true });
+}
+
 export function deploySessionWatcher(extensionPath: string): void {
     console.info(`[deploySessionWatcher] extensionPath: ${extensionPath}`);
     resDir = path.join(extensionPath, 'dist', 'resources');
@@ -98,6 +148,9 @@ export function deploySessionWatcher(extensionPath: string): void {
 }
 
 export function startRequestWatcher(sessionStatusBarItem: StatusBarItem): void {
+    if (!isLiveShare()) {
+        scheduleSessionViewerCleanup();
+    }
     console.info('[startRequestWatcher] Starting');
     requestFile = path.join(homeExtDir(), 'request.log');
     requestLockFile = path.join(homeExtDir(), 'request.lock');
@@ -428,7 +481,7 @@ export async function showDataView(source: string, type: string, title: string, 
                     
                     console.log('[fetchRows] Sending to R:', {varname: title, start, end, sortModel, filterModel});
                     
-                    if (!server) {
+                    if (!server && !isGuestSession) {
                         throw new Error('R server not available');
                     }
 
@@ -624,7 +677,7 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
     <link href="${String(webview.asWebviewUri(Uri.file(path.join(resDir, 'ag-grid.min.css'))))}" rel="stylesheet">
     <link href="${String(webview.asWebviewUri(Uri.file(path.join(resDir, 'ag-theme-balham.min.css'))))}" rel="stylesheet">
     <script>
-    
+
     const vscode = acquireVsCodeApi();
     let hasReceivedFirstRows = false;
 
@@ -1079,9 +1132,7 @@ async function updateRequest(sessionStatusBarItem: StatusBarItem) {
                         purgeAddinPickerItems();
                         await setContext('rSessionActive', true);
                         if (request.plot_url) {
-                            if (!globalHttpgdManager?.hasViewer(pid)) {
-                                await globalHttpgdManager?.showViewer(request.plot_url, pid);
-                            }
+                            globalHttpgdManager?.setLastPlot(request.plot_url, pid);
                         }
                         void watchProcess(pid).then((v: string) => {
                             globalHttpgdManager?.dropPid(v);
@@ -1142,6 +1193,21 @@ export async function cleanupSession(pidArg: string): Promise<void> {
             sessionStatusBarItem.tooltip = 'Click to attach active terminal.';
         }
         server = undefined;
+        if (isLiveShare()) {
+            rHostService?.orderGuestDetach();
+        }
+        globalHttpgdManager?.dropPid(pid);
+        globalHttpgdManager?.clearLastPlot();
+        disposeDataViewPanels();
+        if (!isLiveShare()) {
+            await closeSessionViewers();
+        }
+        globalHttpgdManager?.disposeSharedServers();
+        if (isLiveShare()) {
+            while (browserDisposables.length > 0) {
+                closeBrowser(browserDisposables[0].url);
+            }
+        }
         workspaceData.globalenv = {};
         workspaceData.loaded_namespaces = [];
         workspaceData.search = [];
@@ -1175,7 +1241,16 @@ async function watchProcess(pid: string): Promise<string> {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export async function sessionRequest(server: SessionServer, data: any): Promise<any> {
+export async function sessionRequest(server: SessionServer | undefined, data: any): Promise<any> {
+    if (isGuestSession) {
+        if (!rGuestService) {
+            throw new Error('R server not available');
+        }
+        return rGuestService.requestDataViewRows(data);
+    }
+    if (!server) {
+        throw new Error('R server not available');
+    }
     try {
         const response = await fetch(`http://${server.host}:${server.port}`, {
             agent: httpAgent,

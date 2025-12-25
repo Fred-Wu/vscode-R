@@ -2,14 +2,16 @@ import path = require('path');
 import * as vscode from 'vscode';
 
 import { extensionContext, globalHttpgdManager, globalRHelp, rWorkspace } from '../extension';
-import { asViewColumn, config, readContent } from '../util';
-import { showBrowser, showDataView, showWebView, WorkspaceData } from '../session';
+import { asViewColumn, config, readContent, setContext } from '../util';
+import { disposeDataViewPanels, showBrowser, showDataView, showWebView, SessionServer, WorkspaceData } from '../session';
 import { liveSession, UUID, rGuestService, _sessionStatusBarItem as sessionStatusBarItem } from '.';
 import { autoShareBrowser } from './shareTree';
 import { docProvider, docScheme } from './virtualDocs';
 
 // Workspace Vars
 let guestPid: string;
+let guestAttached: boolean = false;
+let guestAttachRequested: boolean = false;
 export let guestWorkspace: WorkspaceData | undefined;
 export let guestResDir: string;
 let rVer: string;
@@ -39,6 +41,7 @@ export interface IRequest {
     dataview_uuid?: string;  // Add this property
     tempdir?: string;
     version?: string;
+    server?: SessionServer;
     info?: {
         version: string,
         command: string,
@@ -47,18 +50,21 @@ export interface IRequest {
 }
 
 export function initGuest(context: vscode.ExtensionContext): void {
+    if (sessionStatusBarItem) {
+        return;
+    }
     // create status bar item that contains info about the *guest* session watcher
     console.info('Create guestSessionStatusBarItem');
-    const sessionStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 1000);
-    sessionStatusBarItem.command = 'r.attachActiveGuest';
-    sessionStatusBarItem.text = 'Guest R: (not attached)';
-    sessionStatusBarItem.tooltip = 'Click to attach to host terminal';
-    sessionStatusBarItem.show();
+    const guestStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 1000);
+    guestStatusBarItem.command = 'r.attachActiveGuest';
+    guestStatusBarItem.text = 'Guest R: (not attached)';
+    guestStatusBarItem.tooltip = 'Click to attach to host terminal';
+    guestStatusBarItem.show();
     context.subscriptions.push(
-        sessionStatusBarItem,
+        guestStatusBarItem,
         vscode.workspace.registerTextDocumentContentProvider(docScheme, docProvider)
     );
-    rGuestService?.setStatusBarItem(sessionStatusBarItem);
+    rGuestService?.setStatusBarItem(guestStatusBarItem);
     guestResDir = path.join(context.extensionPath, 'dist', 'resources');
 }
 
@@ -67,16 +73,31 @@ export function detachGuest(): void {
     sessionStatusBarItem.text = 'Guest R: (not attached)';
     sessionStatusBarItem.tooltip = 'Click to attach to host terminal';
     guestWorkspace = undefined;
+    guestAttached = false;
+    guestAttachRequested = false;
+    globalHttpgdManager?.closeGuestViewers();
+    panel?.dispose();
+    panel = undefined;
+    disposeDataViewPanels();
     rWorkspace?.refresh();
+    void setContext('rSessionActive', false);
 }
 
 export function attachActiveGuest(): void {
     if (config().get<boolean>('sessionWatcher', true)) {
         console.info('[attachActiveGuest]');
+        if (!sessionStatusBarItem?.text.includes('(not attached)')) {
+            return;
+        }
+        guestAttachRequested = true;
         void rGuestService?.requestAttach();
     } else {
         void vscode.window.showInformationMessage('This command requires that r.sessionWatcher be enabled.');
     }
+}
+
+export function clearGuestAttachRequested(): void {
+    guestAttachRequested = false;
 }
 
 // Guest version of session.ts updateRequest(), no need to check for changes in files
@@ -98,6 +119,25 @@ export async function updateGuestRequest(file: string, force: boolean = false): 
     }
 
     if (force) {
+        if (!guestAttachRequested) {
+            console.info('[updateGuestRequest] attach ignored (not requested)');
+            if (request.command === 'attach' && request.server) {
+                sessionStatusBarItem.text = 'Guest R: (not attached)';
+                sessionStatusBarItem.tooltip = 'Click to attach to host terminal';
+                sessionStatusBarItem.show();
+            }
+            return;
+        }
+        if (request.command === 'attach' && !request.server) {
+            console.info('[updateGuestRequest] attach ignored (missing server)');
+            sessionStatusBarItem.text = 'Guest R: (not attached)';
+            sessionStatusBarItem.tooltip = 'Click to attach to host terminal';
+            sessionStatusBarItem.show();
+            return;
+        }
+        if (request.command !== 'attach') {
+            return;
+        }
         // The last request is not necessarily an attach request.
         guestPid = String(request.pid);
         console.info(`[updateGuestRequest] attach PID: ${guestPid}`);
@@ -118,13 +158,23 @@ export async function updateGuestRequest(file: string, force: boolean = false): 
                 break;
             }
             case 'httpgd': {
-                guestPid = String(request.pid);
-                if (request.url) {
-                    await globalHttpgdManager?.showViewer(request.url, guestPid);
-                }
                 break;
             }
             case 'attach': {
+                if (!request.server) {
+                    console.info('[updateGuestRequest] attach ignored (missing server)');
+                    sessionStatusBarItem.text = 'Guest R: (not attached)';
+                    sessionStatusBarItem.tooltip = 'Click to attach to host terminal';
+                    sessionStatusBarItem.show();
+                    break;
+                }
+                if (!guestAttachRequested) {
+                    console.info('[updateGuestRequest] attach ignored (not requested)');
+                    sessionStatusBarItem.text = 'Guest R: (not attached)';
+                    sessionStatusBarItem.tooltip = 'Click to attach to host terminal';
+                    sessionStatusBarItem.show();
+                    break;
+                }
                 guestPid = String(request.pid);
                 rVer = String(request.version);
                 info = request.info;
@@ -133,6 +183,9 @@ export async function updateGuestRequest(file: string, force: boolean = false): 
                 // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
                 sessionStatusBarItem.tooltip = `${info?.version || 'unknown version'}\nProcess ID: ${guestPid}\nCommand: ${info?.command}\nStart time: ${info?.start_time}\nClick to attach to host terminal.`;
                 sessionStatusBarItem.show();
+                guestAttached = true;
+                guestAttachRequested = false;
+                void setContext('rSessionActive', true);
                 break;
             }
             case 'browser': {
@@ -148,6 +201,9 @@ export async function updateGuestRequest(file: string, force: boolean = false): 
                 break;
             }
             case 'dataview': {
+                if (!guestAttached) {
+                    break;
+                }
                 if (request.source && request.type && request.title && request.file
                     && request.viewer !== undefined) {
                     await showDataView(request.source,

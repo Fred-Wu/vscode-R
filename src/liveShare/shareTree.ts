@@ -2,7 +2,8 @@ import * as vscode from 'vscode';
 import { requestFile } from '../session';
 
 import { config } from '../util';
-import { isLiveShare, rHostService } from '.';
+import { globalHttpgdManager } from '../extension';
+import { isLiveShare, rHostService, liveShareRequest, Callback } from '.';
 
 export let forwardCommands: boolean;
 export let shareWorkspace: boolean;
@@ -103,8 +104,17 @@ class ShareNode extends ToggleNode {
         this.description = shareWorkspace === true ? 'Enabled' : 'Disabled';
         if (shareWorkspace) {
             void rHostService?.notifyRequest(requestFile, true);
+            if (isLiveShare()) {
+                void liveShareRequest(Callback.NotifyMessage, 'Host has enabled R workspace sharing.', 'information');
+            }
         } else {
             void rHostService?.orderGuestDetach();
+            if (isLiveShare()) {
+                void liveShareRequest(Callback.NotifyMessage, 'Host has disabled R workspace sharing.', 'warning');
+            }
+            if (autoShareBrowser) {
+                globalHttpgdManager?.disposeSharedServers();
+            }
         }
         treeProvider.refresh();
     }
