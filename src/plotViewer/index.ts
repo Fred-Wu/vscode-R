@@ -17,7 +17,7 @@ import { extensionContext } from '../extension';
 import { FocusPlotMessage, InMessage, OutMessage, ToggleStyleMessage, UpdatePlotMessage, HidePlotMessage, AddPlotMessage, PreviewPlotLayout, PreviewPlotLayoutMessage, ToggleFullWindowMessage } from './webviewMessages';
 import { HttpgdIdResponse, HttpgdPlotId, HttpgdRendererId } from 'httpgd/lib/types';
 import { Response } from 'node-fetch';
-import { autoShareBrowser, isGuest, isHost, rHostService, shareServer } from '../liveShare';
+import { autoShareBrowser, isGuest, isHost, rHostService, shareServer, isGuestAttached } from '../liveShare';
 import { requestFile, server } from '../session';
 
 const commands = [
@@ -265,6 +265,10 @@ export class HttpgdManager {
 
         if (command === 'showViewers') {
             void (async () => {
+                if (isGuest() && !isGuestAttached()) {
+                    void vscode.window.showWarningMessage('Attach to the host R session before showing plot viewers.');
+                    return;
+                }
                 if (!server && !isGuest()) {
                     for (const viewers of this.recentlyActiveViewers.values()) {
                         viewers.forEach(v => v.show(true));
@@ -288,7 +292,8 @@ export class HttpgdManager {
                                 } finally {
                                     probe.disconnect();
                                 }
-                                await this.showViewer(request.plot_url, String(request.pid));
+                                const pidToUse = isGuest() ? HttpgdManager.GUEST_PID : String(request.pid);
+                                await this.showViewer(request.plot_url, pidToUse);
                                 return;
                             }
                         } catch {

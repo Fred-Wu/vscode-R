@@ -36,6 +36,7 @@ export interface IRequest {
     args?: unknown;
     sd?: string;
     url?: string;
+    plot_url?: string;
     requestPath?: string;
     uuid?: number;
     dataview_uuid?: string;  // Add this property
@@ -98,6 +99,10 @@ export function attachActiveGuest(): void {
 
 export function clearGuestAttachRequested(): void {
     guestAttachRequested = false;
+}
+
+export function isGuestAttached(): boolean {
+    return guestAttached;
 }
 
 // Guest version of session.ts updateRequest(), no need to check for changes in files
@@ -183,6 +188,9 @@ export async function updateGuestRequest(file: string, force: boolean = false): 
                 // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
                 sessionStatusBarItem.tooltip = `${info?.version || 'unknown version'}\nProcess ID: ${guestPid}\nCommand: ${info?.command}\nStart time: ${info?.start_time}\nClick to attach to host terminal.`;
                 sessionStatusBarItem.show();
+                if (request.plot_url) {
+                    globalHttpgdManager?.setLastPlot(request.plot_url, '__guest__');
+                }
                 guestAttached = true;
                 guestAttachRequested = false;
                 void setContext('rSessionActive', true);

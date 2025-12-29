@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs-extra';
 
 import { rHostService, isGuest, service } from '.';
-import { updateGuestRequest, updateGuestWorkspace, updateGuestPlot, detachGuest, clearGuestAttachRequested } from './shareSession';
+import { updateGuestRequest, updateGuestWorkspace, updateGuestPlot, detachGuest, clearGuestAttachRequested, isGuestAttached } from './shareSession';
 import { forwardCommands, shareWorkspace } from './shareTree';
 
 import { runTextInTerm } from '../rTerminal';
@@ -123,6 +123,9 @@ export const Commands: ICommands = {
             void updateGuestPlot(args[0]);
         },
         [Callback.NotifyGuestPlotManager]: (args: [url: string]): void => {
+            if (!isGuestAttached()) {
+                return;
+            }
             void globalHttpgdManager?.showGuestViewer(args[0]);
         },
         [Callback.OrderDetach]: (): void => {
