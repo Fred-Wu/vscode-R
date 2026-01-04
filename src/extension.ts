@@ -52,7 +52,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<apiImp
     // assign extension context to global variable
     extensionContext = context;
     
-        // hide R activity icon until a session attaches
+    // hide R activity icon until a session attaches
     void vscode.commands.executeCommand('setContext', 'rSessionActive', false);
 
     // assign session watcher setting to global variable
@@ -150,6 +150,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<apiImp
         // browser controls
         'r.browser.refresh': session.refreshBrowser,
         'r.browser.openExternal': session.openExternalBrowser,
+        'r.dataview.refresh': session.refreshDataViewPanel,
 
         // (help related commands are registered in rHelp.initializeHelp)
     };
