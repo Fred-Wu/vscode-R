@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.0.5 - 2026-01-04
+
+### Major
+* Added a UI button to refresh data viewer.
+
+### Minor
+* Simplified data viewer loading overlay text.
+* Fixed completion trigger `$` that may not show anything, ie from R6 or R7. For a package like `torch`, if a method was not implemented, and resulted in an error, the completion would not suggest the method. 
+* Fixed data viewer if an object is an environment.
+
+
+
 ## 3.0.2 - 2025-11-17
 
 ### Minor

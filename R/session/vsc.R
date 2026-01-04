@@ -116,7 +116,9 @@ dataview_table <- local({
              sortModel = NULL, filterModel = NULL,
              metadata_only = FALSE, force = FALSE) {
 
-        if (!is.data.frame(data) && !is.matrix(data) && !inherits(data, "ArrowTabular")) {
+        if (!is.data.frame(data) && !is.matrix(data) &&
+            !inherits(data, "ArrowTabular") &&
+            !inherits(data, "polars_data_frame")) {
             stop("data must be a data frame, a matrix or an arrow table object.")
         }
 
@@ -322,13 +324,21 @@ if (use_webserver) {
                     }
 
                     result <- lapply(names, function(name) {
-                        item <- obj[[name]]
+                        err_msg <- NULL
+                        item <- tryCatch(obj[[name]], error = function(e) {
+                            err_msg <<- conditionMessage(e)
+                            NULL
+                        })
+                        if (!is.null(err_msg)) {
+                            return(NULL)
+                        }
                         list(
                             name = name,
                             type = typeof(item),
                             str = try_capture_str(item)
                         )
                     })
+                    result <- Filter(Negate(is.null), result)
                     return(result)
                 }
 
@@ -352,10 +362,19 @@ if (use_webserver) {
                 }
                 fm_env <- get(".dataview_first_map", envir = .GlobalEnv)
 
-                obj <- if (exists(varname, envir = .GlobalEnv)) {
-                    get(varname, envir = .GlobalEnv)
-                } else {
-                    eval(parse(text = varname), envir = .GlobalEnv)
+                obj <- NULL
+                if (exists(".vsc_env_view_cache", envir = .GlobalEnv, inherits = FALSE)) {
+                    cache_env <- get(".vsc_env_view_cache", envir = .GlobalEnv)
+                    if (!is.null(cache_env[[varname]])) {
+                        obj <- cache_env[[varname]]
+                    }
+                }
+                if (is.null(obj)) {
+                    obj <- if (exists(varname, envir = .GlobalEnv)) {
+                        get(varname, envir = .GlobalEnv)
+                    } else {
+                        eval(parse(text = varname), envir = .GlobalEnv)
+                    }
                 }
 
                 attr(obj, "_dvkey") <- varname
@@ -366,6 +385,104 @@ if (use_webserver) {
                 out <- dataview_table(obj, start, end, sortModel, filterModel, force = is_first)
                 out$columns <- NULL
                 return(out)
+            },
+            dataview_refresh = function(varname, ...) {
+                if (!exists(".dataview_first_map", envir = .GlobalEnv, inherits = FALSE)) {
+                    assign(".dataview_first_map", new.env(parent = emptyenv()), envir = .GlobalEnv)
+                }
+                fm_env <- get(".dataview_first_map", envir = .GlobalEnv)
+                fm_env[[varname]] <- NULL
+                if (exists(".vsc_env_view_cache", envir = .GlobalEnv, inherits = FALSE)) {
+                    cache_env <- get(".vsc_env_view_cache", envir = .GlobalEnv)
+                    cache_env[[varname]] <- NULL
+                }
+
+                obj <- if (exists(varname, envir = .GlobalEnv)) {
+                    get(varname, envir = .GlobalEnv)
+                } else {
+                    eval(parse(text = varname), envir = .GlobalEnv)
+                }
+
+                if (is.environment(obj)) {
+                    all_names <- ls(obj)
+                    is_active <- vapply(all_names, bindingIsActive, logical(1), USE.NAMES = TRUE, obj)
+                    is_promise <- rlang::env_binding_are_lazy(obj, all_names[!is_active])
+                    obj <- lapply(all_names, function(name) {
+                        if (isTRUE(is_promise[name])) {
+                            data.frame(
+                                name = name,
+                                class = "promise",
+                                type = "promise",
+                                length = 0L,
+                                size = 0L,
+                                value = "(promise)",
+                                stringsAsFactors = FALSE,
+                                check.names = FALSE
+                            )
+                        } else if (isTRUE(is_active[name])) {
+                            data.frame(
+                                name = name,
+                                class = "active_binding",
+                                type = "active_binding",
+                                length = 0L,
+                                size = 0L,
+                                value = "(active-binding)",
+                                stringsAsFactors = FALSE,
+                                check.names = FALSE
+                            )
+                        } else {
+                            obj_item <- obj[[name]]
+                            data.frame(
+                                name = name,
+                                class = paste0(class(obj_item), collapse = ", "),
+                                type = typeof(obj_item),
+                                length = length(obj_item),
+                                size = as.integer(object.size(obj_item)),
+                                value = trimws(try_capture_str(obj_item, 0)),
+                                stringsAsFactors = FALSE,
+                                check.names = FALSE
+                            )
+                        }
+                    })
+                    names(obj) <- all_names
+                    if (length(obj)) {
+                        obj <- do.call(rbind, obj)
+                    } else {
+                        obj <- data.frame(
+                            name = character(),
+                            class = character(),
+                            type = character(),
+                            length = integer(),
+                            size = integer(),
+                            value = character(),
+                            stringsAsFactors = FALSE,
+                            check.names = FALSE
+                        )
+                    }
+                    if (!exists(".vsc_env_view_cache", envir = .GlobalEnv, inherits = FALSE)) {
+                        assign(".vsc_env_view_cache", new.env(parent = emptyenv()), envir = .GlobalEnv)
+                    }
+                    cache_env <- get(".vsc_env_view_cache", envir = .GlobalEnv)
+                    cache_env[[varname]] <- obj
+                }
+
+                if (inherits(obj, "ArrowTabular")) {
+                    obj <- obj[1, ]$to_data_frame()
+                }
+
+                if (inherits(obj, "polars_data_frame")) {
+                    obj <- as.data.frame(obj[0, ])
+                }
+
+                if (!is.data.frame(obj) && !is.matrix(obj)) {
+                    stop("dataview_refresh expects a data.frame or matrix.")
+                }
+
+                attr(obj, "_dvkey") <- varname
+                meta <- dataview_table(obj, start = 0, end = 0, force = TRUE)
+                file <- tempfile(tmpdir = tempdir, fileext = ".json")
+                jsonlite::write_json(meta, file, na = "string", null = "null", auto_unbox = TRUE, force = TRUE)
+                list(file = file)
             }
         )
 
@@ -727,6 +844,10 @@ if (show_view) {
             x <- x[1, ]$to_data_frame()
         }
 
+        if (inherits(x, "polars_data_frame")) {
+            x <- as.data.frame(x[0, ])
+        }
+
         if (is.environment(x)) {
             all_names <- ls(x)
             is_active <- vapply(all_names, bindingIsActive, logical(1), USE.NAMES = TRUE, x)
@@ -734,6 +855,7 @@ if (show_view) {
             x <- lapply(all_names, function(name) {
                 if (isTRUE(is_promise[name])) {
                     data.frame(
+                        name = name,
                         class = "promise",
                         type = "promise",
                         length = 0L,
@@ -744,6 +866,7 @@ if (show_view) {
                     )
                 } else if (isTRUE(is_active[name])) {
                     data.frame(
+                        name = name,
                         class = "active_binding",
                         type = "active_binding",
                         length = 0L,
@@ -755,6 +878,7 @@ if (show_view) {
                 } else {
                     obj <- x[[name]]
                     data.frame(
+                        name = name,
                         class = paste0(class(obj), collapse = ", "),
                         type = typeof(obj),
                         length = length(obj),
@@ -770,6 +894,7 @@ if (show_view) {
                 x <- do.call(rbind, x)
             } else {
                 x <- data.frame(
+                    name = character(),
                     class = character(),
                     type = character(),
                     length = integer(),
@@ -779,6 +904,11 @@ if (show_view) {
                     check.names = FALSE
                 )
             }
+            if (!exists(".vsc_env_view_cache", envir = .GlobalEnv, inherits = FALSE)) {
+                assign(".vsc_env_view_cache", new.env(parent = emptyenv()), envir = .GlobalEnv)
+            }
+            cache_env <- get(".vsc_env_view_cache", envir = .GlobalEnv)
+            cache_env[[title]] <- x
         }
         if (is.data.frame(x) || is.matrix(x)) {
             x <- data.table::as.data.table(x[0, , drop = FALSE])

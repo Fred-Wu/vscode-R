@@ -13,7 +13,6 @@ import { cleanLine } from './lineCache';
 import { globalRHelp } from './extension';
 import { config } from './util';
 import { getChunks } from './rmarkdown';
-import { CompletionItemKind } from 'vscode-languageclient';
 
 
 // Get with names(roxygen2:::default_tags())
@@ -222,10 +221,18 @@ function getCompletionItemsFromElements(elements: RObjectElement[], detail: stri
     const len = elements.length.toString().length;
     let index = 0;
     return elements.map((e) => {
-        const item = new vscode.CompletionItem(e.name, (e.type === 'closure' || e.type === 'builtin') ? CompletionItemKind.Function : vscode.CompletionItemKind.Variable);
+        const isFunctionType = e.type === 'closure' || e.type === 'builtin';
+        const isFunctionStr = /^\s*function\s*\(/.test(e.str);
+        const item = new vscode.CompletionItem(
+            e.name,
+            isFunctionType ? vscode.CompletionItemKind.Function : vscode.CompletionItemKind.Variable
+        );
         item.detail = detail;
         item.documentation = new vscode.MarkdownString(`\`\`\`r\n${e.str}\n\`\`\``);
         item.sortText = `0-${index.toString().padStart(len, '0')}`;
+        if (isFunctionType || isFunctionStr) {
+            item.insertText = new vscode.SnippetString(`${e.name}($0)`);
+        }
         index++;
         return item;
     });

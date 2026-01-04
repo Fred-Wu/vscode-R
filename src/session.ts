@@ -50,6 +50,7 @@ interface WebviewMessage {
 
 interface PanelWithFetchFlag {
   _hasFetchHandler?: boolean;
+  _hasViewStateHandler?: boolean;
 }
 
 export let workspaceData: WorkspaceData;
@@ -80,6 +81,8 @@ let activeBrowserExternalUri: Uri | undefined;
 
 // Add a map to track dataview panels by UUID
 const dataviewPanels = new Map<string, WebviewPanel>();
+const dataviewPanelInfo = new Map<WebviewPanel, { title: string; source: string }>();
+let activeDataViewPanel: WebviewPanel | undefined;
 
 export function disposeDataViewPanels(): void {
     for (const panel of dataviewPanels.values()) {
@@ -376,6 +379,42 @@ export function openExternalBrowser(): void {
         void env.openExternal(activeBrowserUri);
     }
 }
+export async function refreshDataViewPanel(): Promise<void> {
+    const panel = activeDataViewPanel;
+    if (!panel) {
+        void window.showWarningMessage('No active data viewer to refresh.');
+        return;
+    }
+    const info = dataviewPanelInfo.get(panel);
+    if (!info || info.source !== 'table') {
+        void window.showWarningMessage('Active data viewer cannot be refreshed.');
+        return;
+    }
+    if (!server && !isGuestSession) {
+        void window.showWarningMessage('R server not available.');
+        return;
+    }
+    try {
+        const response: unknown = await sessionRequest(server, {
+            type: 'dataview_refresh',
+            varname: info.title
+        });
+        if (typeof response !== 'object' || response === null || !('file' in response)) {
+            throw new Error('Invalid response from R server');
+        }
+        const file: unknown = (response as { file: string }).file;
+        if (typeof file !== 'string' || !file) {
+            throw new Error('Invalid file path from R server');
+        }
+        const content = await getTableHtml(panel.webview, file);
+        panel.webview.html = '';
+        panel.webview.html = content;
+        await panel?.webview.postMessage({ command: 'initAgGridRequestMap' });
+    } catch (error) {
+        console.error('[refreshDataViewPanel] Error:', error);
+        void window.showErrorMessage('Failed to refresh data viewer.');
+    }
+}
 
 export async function showWebView(file: string, title: string, viewer: string | boolean): Promise<void> {
     console.info(`[showWebView] file: ${file}, viewer: ${viewer.toString()}`);
@@ -467,13 +506,42 @@ export async function showDataView(source: string, type: string, title: string, 
         }
     }
 
+    if (panel) {
+        const panelRef = panel;
+        dataviewPanelInfo.set(panelRef, { title, source });
+        const panelState = panelRef as PanelWithFetchFlag;
+        if (!panelState._hasViewStateHandler) {
+            panelRef.onDidChangeViewState((event: WebviewPanelOnDidChangeViewStateEvent) => {
+                if (event.webviewPanel.active) {
+                    activeDataViewPanel = event.webviewPanel;
+                    void setContext('r.dataview.active', true);
+                } else if (activeDataViewPanel === event.webviewPanel) {
+                    activeDataViewPanel = undefined;
+                    void setContext('r.dataview.active', false);
+                }
+            });
+            panelRef.onDidDispose(() => {
+                dataviewPanelInfo.delete(panelRef);
+                if (activeDataViewPanel === panelRef) {
+                    activeDataViewPanel = undefined;
+                    void setContext('r.dataview.active', false);
+                }
+            });
+            panelState._hasViewStateHandler = true;
+        }
+        if (panelRef.active) {
+            activeDataViewPanel = panelRef;
+            void setContext('r.dataview.active', true);
+        }
+    }
+
     // Register the message handler after panel is created or retrieved, but only once per panel
     const p = panel as PanelWithFetchFlag;
     if (panel && !p._hasFetchHandler) {
         panel.webview.onDidReceiveMessage(async (message: WebviewMessage & {
           requestId?: string;
           sortModel?: Array<{ colId: string; sort: 'asc' | 'desc' }>;
-          filterModel?: {[colId: string]: any};
+          filterModel?: {[colId: string]: unknown};
         }) => {
             if (message.command === 'fetchRows') {
                 try {
@@ -555,15 +623,11 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
             throw new Error('Empty content in getTableHtml');
         }
 
-        // Parse once — we use this for both metadata detection and injection
-        let parsedData: any;
         try {
-            parsedData = JSON.parse(content);
+            JSON.parse(content);
         } catch (e) {
             throw new Error('Failed to parse JSON from R dataview');
         }
-
-        const hasTotalRows = typeof parsedData.totalRows === 'number';
 
         return `
 <!DOCTYPE html>
@@ -609,12 +673,6 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
         from { transform: rotate(0deg); }
         to { transform: rotate(360deg); }
     }
-    #rowInfo {
-        margin-top: 12px;
-        font-size: 14px;
-        color: var(--vscode-descriptionForeground);
-    }
-
     /* Your original styles (unchanged) */
     [class*="vscode"] div.ag-root-wrapper {
         background-color: var(--vscode-editor-background);
@@ -708,22 +766,8 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
     // Inject raw JSON data from R
     const data = ${content};
 
-    // NEW: Update loading text with row count
-    function updateRowCount(total, unfiltered = total) {
-        const el = document.getElementById('rowInfo');
-        if (el) {
-            el.textContent = total.toLocaleString() + 
-                (unfiltered > total ? ' of ' + unfiltered.toLocaleString() : '') + ' rows';
-        }
-    }
-
-    // If R already sent totalRows (recommended), show it immediately
-    ${hasTotalRows ? `updateRowCount(${parsedData.totalRows}, ${parsedData.totalUnfiltered || parsedData.totalRows});` : ''}
-
     const displayDataSource = {
         rowCount: undefined,
-        _TotalRows: ${hasTotalRows ? parsedData.totalRows : 0},
-        _TotalUnfiltered: ${hasTotalRows ? (parsedData.totalUnfiltered || parsedData.totalRows) : 0},
         getRows(params) {
             const msg = {
                 command: 'fetchRows',
@@ -746,7 +790,6 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
 
                     displayDataSource._TotalRows = m.totalRows;
                     displayDataSource._TotalUnfiltered = m.totalUnfiltered;
-                    updateRowCount(m.totalRows, m.totalUnfiltered);
                     displayDataSource.api?.refreshHeader();
 
                     const totalRows = m.totalRows;
@@ -897,11 +940,10 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
     </script>
 </head>
 <body onload='onload()'>
-    <!-- NEW: Loading overlay with spinner and row count -->
+    <!-- NEW: Loading overlay with spinner -->
     <div id="loadingOverlay">
         <div class="spinner">⟳</div>
-        <div>Loading data viewer...</div>
-        <div id="rowInfo">Preparing ${parsedData.columns?.length - 2 || 0} columns...</div>
+        <div>Loading...</div>
     </div>
     <div id="myGrid" style="height: 100%;"></div>
 </body>
