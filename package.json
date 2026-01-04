@@ -2,7 +2,7 @@
   "name": "r",
   "displayName": "R",
   "description": "R Extension for Visual Studio Code",
-  "version": "3.0.4",
+  "version": "3.0.5",
   "author": "REditorSupport",
   "license": "SEE LICENSE IN LICENSE",
   "publisher": "REditorSupport",
@@ -249,6 +249,12 @@
         "title": "Open in external browser",
         "icon": "$(link-external)",
         "category": "R"
+      },
+      {
+        "command": "r.dataview.refresh",
+        "title": "Refresh Data Viewer",
+        "icon": "$(refresh)",
+        "category": "R Data Viewer"
       },
       {
         "command": "r.showHelp",
@@ -1023,6 +1029,11 @@
         {
           "command": "r.browser.openExternal",
           "when": "resourceScheme =~ /webview/ && r.browser.active",
+          "group": "navigation"
+        },
+        {
+          "command": "r.dataview.refresh",
+          "when": "resourceScheme =~ /webview/ && r.dataview.active",
           "group": "navigation"
         },
         {
