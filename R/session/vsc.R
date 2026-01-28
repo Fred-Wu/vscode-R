@@ -690,17 +690,19 @@ inspect_env <- function(env, cache) {
                     info_str <- try_capture_str(obj, 0)
                 }
                 info$str <- scalar(trimws(info_str))
-                obj_names <- if (is.object(obj)) {
-                    .DollarNames(obj, pattern = "")
-                } else if (is.recursive(obj)) {
-                    names(obj)
-                } else {
-                    NULL
-                }
+            }
 
-                if (length(obj_names)) {
-                    info$names <- obj_names
-                }
+            # Always get names for autocomplete (fast, even for large objects)
+            obj_names <- if (is.object(obj)) {
+                .DollarNames(obj, pattern = "")
+            } else if (is.recursive(obj)) {
+                names(obj)
+            } else {
+                NULL
+            }
+
+            if (length(obj_names)) {
+                info$names <- obj_names
             }
 
             if (isS4(obj)) {
@@ -726,7 +728,16 @@ workspace_file <- file.path(dir_session, "workspace.json")
 workspace_lock_file <- file.path(dir_session, "workspace.lock")
 file.create(workspace_lock_file, showWarnings = FALSE)
 
-update_workspace <- function(...) {
+# Deferred workspace scanning - scan when R is idle, not immediately after command
+pending_workspace_scan <- NULL
+workspace_scan_delay <- getOption("vsc.workspace_scan_delay", 0.2)  # 200ms default
+use_later <- requireNamespace("later", quietly = TRUE)
+if (!use_later) {
+    message("Install package `later` for improved terminal responsiveness: install.packages('later')")
+}
+
+do_workspace_scan <- function() {
+    pending_workspace_scan <<- NULL
     tryCatch({
         data <- list(
             search = search()[-1],
@@ -736,6 +747,20 @@ update_workspace <- function(...) {
         jsonlite::write_json(data, workspace_file, force = TRUE, pretty = FALSE)
         cat(get_timestamp(), file = workspace_lock_file)
     }, error = message)
+}
+
+update_workspace <- function(...) {
+    if (use_later) {
+        # Cancel any pending scan (debounce)
+        if (!is.null(pending_workspace_scan)) {
+            tryCatch(later::later_cancel(pending_workspace_scan), error = function(e) NULL)
+        }
+        # Schedule scan after delay (runs when R is idle)
+        pending_workspace_scan <<- later::later(do_workspace_scan, delay = workspace_scan_delay)
+    } else {
+        # Fallback: immediate scan if 'later' not available
+        do_workspace_scan()
+    }
     TRUE
 }
 update_workspace()
