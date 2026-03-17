@@ -728,16 +728,7 @@ workspace_file <- file.path(dir_session, "workspace.json")
 workspace_lock_file <- file.path(dir_session, "workspace.lock")
 file.create(workspace_lock_file, showWarnings = FALSE)
 
-# Deferred workspace scanning - scan when R is idle, not immediately after command
-pending_workspace_scan <- NULL
-workspace_scan_delay <- getOption("vsc.workspace_scan_delay", 0.2)  # 200ms default
-use_later <- requireNamespace("later", quietly = TRUE)
-if (!use_later) {
-    message("Install package `later` for improved terminal responsiveness: install.packages('later')")
-}
-
-do_workspace_scan <- function() {
-    pending_workspace_scan <<- NULL
+update_workspace <- function(...) {
     tryCatch({
         data <- list(
             search = search()[-1],
@@ -747,20 +738,6 @@ do_workspace_scan <- function() {
         jsonlite::write_json(data, workspace_file, force = TRUE, pretty = FALSE)
         cat(get_timestamp(), file = workspace_lock_file)
     }, error = message)
-}
-
-update_workspace <- function(...) {
-    if (use_later) {
-        # Cancel any pending scan (debounce)
-        if (!is.null(pending_workspace_scan)) {
-            tryCatch(later::later_cancel(pending_workspace_scan), error = function(e) NULL)
-        }
-        # Schedule scan after delay (runs when R is idle)
-        pending_workspace_scan <<- later::later(do_workspace_scan, delay = workspace_scan_delay)
-    } else {
-        # Fallback: immediate scan if 'later' not available
-        do_workspace_scan()
-    }
     TRUE
 }
 update_workspace()

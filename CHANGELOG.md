@@ -2,7 +2,6 @@
 
 ## 3.0.6 - 2026-03-17
 
-* Added later package to scan and update workspace in a later time.
 * Removed "No text editor active." warning pop-up.
 
 ## 3.0.5 - 2026-01-04
