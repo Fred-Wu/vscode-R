@@ -5,7 +5,12 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+      - "Enhanced_v[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: write
 
 env:
   SCRIPT_DIR: ./.github/scripts
@@ -14,7 +19,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - run: node $SCRIPT_DIR/enableWebpack.js
       - run: npm install
       - uses: lannonbr/vsce-action@4.0.0
@@ -22,7 +27,7 @@ jobs:
           args: "package"
       - name: Identify output file # can be retrieved as steps.filenames.outputs.file_out
         id: filenames
-        run: echo "::set-output name=file_out::$(ls | grep "^.*\.vsix$" | head -1)"
+        run: echo "file_out=$(find . -maxdepth 1 -name '*.vsix' -print -quit | sed 's#^\./##')" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.filenames.outputs.file_out }}
@@ -34,28 +39,62 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - uses: actions/checkout@v4
       - name: Download artifacts
         uses: actions/download-artifact@v4.1.7
         with:
           path: "artifacts/"
       - name: Get version from tag
         id: get_version
-        run: echo ::set-output name=version::${GITHUB_REF/refs\/tags\/v/}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag##*v}" >> "$GITHUB_OUTPUT"
+      - name: Extract release notes from changelog
+        run: |
+          version="${{ steps.get_version.outputs.version }}"
+          extract_section() {
+            awk -v heading="$1" '
+              /^##[[:space:]]+/ {
+                current = $0
+                sub(/^##[[:space:]]+/, "", current)
+                sub(/[[:space:]]+-.*$/, "", current)
+                if (current == heading) {
+                  in_section = 1
+                  next
+                }
+                if (in_section) {
+                  exit
+                }
+              }
+              in_section { print }
+            ' CHANGELOG.md
+          }
+          extract_section "$version" > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            extract_section "Unreleased" > release-notes.md
+          fi
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::error::CHANGELOG.md does not contain a section for ${version} or Unreleased."
+            exit 1
+          fi
       - name: Create release
-        uses: marvinpinto/action-automatic-releases@latest
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          files: "artifacts/*/*"
-          prerelease: false
-          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.get_version.outputs.tag }}" artifacts/*/* \
+            --title "${{ steps.get_version.outputs.tag }}" \
+            --notes-file release-notes.md \
+            --verify-tag
 
 
   publish:
     name: Publish
+    needs: release
     timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - run: node $SCRIPT_DIR/enableWebpack.js
       - run: npm install
       - name: Publish to Open VSX Registry
