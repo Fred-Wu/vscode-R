@@ -1,7 +1,7 @@
 name: release
 
 # runs when a tag v* is pushed
-# releases the extension to GitHub and the vscode marketplace
+# packages the extension and creates a GitHub release
 
 on:
   push:
@@ -86,25 +86,3 @@ jobs:
             --title "${{ steps.get_version.outputs.tag }}" \
             --notes-file release-notes.md \
             --verify-tag
-
-
-  publish:
-    name: Publish
-    needs: release
-    timeout-minutes: 30
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: node $SCRIPT_DIR/enableWebpack.js
-      - run: npm install
-      - name: Publish to Open VSX Registry
-        uses: HaaLeo/publish-vscode-extension@v1
-        id: publishToOpenVSX
-        with:
-          pat: ${{ secrets.OPEN_VSX_TOKEN }}
-      - name: Publish to Visual Studio Marketplace
-        uses: HaaLeo/publish-vscode-extension@v1
-        with:
-          pat: ${{ secrets.VSCE_TOKEN }}
-          registryUrl: https://marketplace.visualstudio.com
-          extensionFile: ${{ steps.publishToOpenVSX.outputs.vsixPath }}
