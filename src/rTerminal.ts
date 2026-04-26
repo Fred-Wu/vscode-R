@@ -164,7 +164,7 @@ export async function createRTermSide(): Promise<boolean> {
     }
     
     // Set location to create terminal directly in editor area
-    (termOptions as any).location = { viewColumn: vscode.ViewColumn.Beside };
+    termOptions.location = { viewColumn: vscode.ViewColumn.Beside };
     
     rTerm = vscode.window.createTerminal(termOptions);
     rTerm.show(true);

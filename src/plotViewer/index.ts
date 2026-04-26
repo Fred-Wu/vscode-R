@@ -10,7 +10,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as ejs from 'ejs';
 
-import { asViewColumn, config, readContent, setContext, UriIcon, makeWebviewCommandUriString } from '../util';
+import { asViewColumn, config, setContext, UriIcon, makeWebviewCommandUriString } from '../util';
 
 import { extensionContext } from '../extension';
 
@@ -18,7 +18,7 @@ import { FocusPlotMessage, InMessage, OutMessage, ToggleStyleMessage, UpdatePlot
 import { HttpgdIdResponse, HttpgdPlotId, HttpgdRendererId } from 'httpgd/lib/types';
 import { Response } from 'node-fetch';
 import { autoShareBrowser, isGuest, isHost, rHostService, shareServer, isGuestAttached } from '../liveShare';
-import { requestFile, server } from '../session';
+import { attachActive, getAttachedPid } from '../session';
 
 const commands = [
     'showViewers',
@@ -64,6 +64,8 @@ export class HttpgdManager {
 
     private lastPlotUrl?: string;
     private lastPlotPid?: string;
+    private lastPlotUrlsByPid = new Map<string, string>();
+    private showAttachedViewerOnNextAttach = false;
     
     private static readonly MANUAL_PID = '__manual__';
     private static readonly GUEST_PID = '__guest__';
@@ -78,8 +80,7 @@ export class HttpgdManager {
     }
 
     public async showViewer(urlString: string, pid: string): Promise<void> {
-        this.lastPlotUrl = urlString;
-        this.lastPlotPid = pid;
+        this.setLastPlot(urlString, pid);
         const url = new URL(urlString);
         const host = url.host;
         const token = url.searchParams.get('token') || undefined;
@@ -119,10 +120,7 @@ export class HttpgdManager {
             this.viewerOptions.token = token;
             const viewer = new HttpgdViewer(host, this.viewerOptions, pid);
             viewers.unshift(viewer);
-            
-            viewer.webviewPanel?.onDidDispose(() => {
-            });
-            
+
             if (isHost() && autoShareBrowser) {
                 try {
                     const disposable = await shareServer(url, 'httpgd');
@@ -161,23 +159,31 @@ export class HttpgdManager {
     public setLastPlot(urlString: string, pid: string): void {
         this.lastPlotUrl = urlString;
         this.lastPlotPid = pid;
+        this.lastPlotUrlsByPid.set(pid, urlString);
     }
 
     public getLastPlotUrl(): string | undefined {
         return this.lastPlotUrl;
     }
 
-    public clearLastPlot(): void {
+    public clearLastPlot(pid?: string): void {
+        if (pid) {
+            this.lastPlotUrlsByPid.delete(pid);
+            if (this.lastPlotPid === pid) {
+                this.lastPlotUrl = undefined;
+                this.lastPlotPid = undefined;
+            }
+            return;
+        }
+
         this.lastPlotUrl = undefined;
         this.lastPlotPid = undefined;
+        this.lastPlotUrlsByPid.clear();
     }
 
     public closeGuestViewers(): void {
         this.dropPid(HttpgdManager.GUEST_PID);
-        if (this.lastPlotPid === HttpgdManager.GUEST_PID) {
-            this.lastPlotUrl = undefined;
-            this.lastPlotPid = undefined;
-        }
+        this.clearLastPlot(HttpgdManager.GUEST_PID);
     }
 
     private normalizeSharedKey(urlString: string): string {
@@ -238,20 +244,98 @@ export class HttpgdManager {
     }
     
     public async showGuestViewer(urlString: string): Promise<void> {
-      await this.showViewer(urlString, HttpgdManager.GUEST_PID);
+        await this.showViewer(urlString, HttpgdManager.GUEST_PID);
+    }
+
+    public requestShowAttachedViewerOnNextAttach(): void {
+        this.showAttachedViewerOnNextAttach = true;
+    }
+
+    public async handleAttachedPlot(plotUrl: string | undefined, pid: string): Promise<void> {
+        if (plotUrl) {
+            if (this.showAttachedViewerOnNextAttach) {
+                await this.showViewer(plotUrl, pid);
+            } else {
+                this.setLastPlot(plotUrl, pid);
+            }
+        } else if (this.showAttachedViewerOnNextAttach) {
+            void vscode.window.showWarningMessage('No active httpgd plot viewer for the attached R session.');
+        }
+
+        this.showAttachedViewerOnNextAttach = false;
     }
     
     public hasViewer(pid: string): boolean {
-      const viewers = this.recentlyActiveViewers.get(pid);
-      return !!viewers && viewers.some(v => v.webviewPanel);
+        const viewers = this.recentlyActiveViewers.get(pid);
+        return !!viewers && viewers.some(v => v.webviewPanel);
     }
     
     public dropPid(pid: string): void {
         const viewers = this.recentlyActiveViewers.get(pid);
-        if (!viewers) return;
+        if (!viewers) {
+            return;
+        }
         
-        viewers.forEach(v => v.webviewPanel?.dispose());
+        viewers.forEach(v => {
+            v.webviewPanel?.dispose();
+        });
+        this.viewers = this.viewers.filter(v => !viewers.includes(v));
         this.recentlyActiveViewers.delete(pid);
+        this.clearLastPlot(pid);
+    }
+
+    private async canConnect(urlString: string): Promise<boolean> {
+        let probe: Httpgd | undefined;
+        try {
+            const url = new URL(urlString);
+            const token = url.searchParams.get('token') || undefined;
+            probe = new Httpgd(url.host, token, true);
+            await probe.connect();
+            return true;
+        } catch {
+            void vscode.window.showWarningMessage('No active shared plot server.');
+            return false;
+        } finally {
+            probe?.disconnect();
+        }
+    }
+
+    private async showViewersForPid(pid: string): Promise<boolean> {
+        const viewers = this.recentlyActiveViewers.get(pid);
+        if (viewers?.length) {
+            viewers.forEach(v => v.show(true));
+            return true;
+        }
+
+        const lastPlotUrl = this.lastPlotUrlsByPid.get(pid);
+        if (!lastPlotUrl || !(await this.canConnect(lastPlotUrl))) {
+            return false;
+        }
+
+        await this.showViewer(lastPlotUrl, pid);
+        return true;
+    }
+
+    private async showViewersForActiveSession(): Promise<void> {
+        if (isGuest()) {
+            if (!isGuestAttached()) {
+                void vscode.window.showWarningMessage('Attach to the host R session before showing plot viewers.');
+                return;
+            }
+            await this.showViewersForPid(HttpgdManager.GUEST_PID);
+            return;
+        }
+
+        const attachedPid = getAttachedPid();
+        if (attachedPid && await this.showViewersForPid(attachedPid)) {
+            return;
+        }
+        if (!attachedPid && await this.showViewersForPid(HttpgdManager.MANUAL_PID)) {
+            return;
+        }
+
+        this.requestShowAttachedViewerOnNextAttach();
+        attachActive();
     }
 
     // generic command handler
@@ -264,67 +348,7 @@ export class HttpgdManager {
         //
 
         if (command === 'showViewers') {
-            void (async () => {
-                if (isGuest() && !isGuestAttached()) {
-                    void vscode.window.showWarningMessage('Attach to the host R session before showing plot viewers.');
-                    return;
-                }
-                if (!server && !isGuest()) {
-                    for (const viewers of this.recentlyActiveViewers.values()) {
-                        viewers.forEach(v => v.show(true));
-                    }
-                    return;
-                }
-                if (this.recentlyActiveViewers.size === 0 && requestFile) {
-                    const requestContent = await readContent(requestFile, 'utf8');
-                    if (typeof requestContent === 'string') {
-                        try {
-                            const request = JSON.parse(requestContent) as { plot_url?: string; pid?: string };
-                            if (request.plot_url && request.pid) {
-                                const url = new URL(request.plot_url);
-                                const token = url.searchParams.get('token') || undefined;
-                                const probe = new Httpgd(url.host, token, true);
-                                try {
-                                    await probe.connect();
-                                } catch {
-                                    void vscode.window.showWarningMessage('No active shared plot server.');
-                                    return;
-                                } finally {
-                                    probe.disconnect();
-                                }
-                                const pidToUse = isGuest() ? HttpgdManager.GUEST_PID : String(request.pid);
-                                await this.showViewer(request.plot_url, pidToUse);
-                                return;
-                            }
-                        } catch {
-                            // Ignore malformed request content.
-                        }
-                    }
-                }
-                if (this.recentlyActiveViewers.size === 0 && this.lastPlotUrl && this.lastPlotPid) {
-                    try {
-                        const url = new URL(this.lastPlotUrl);
-                        const token = url.searchParams.get('token') || undefined;
-                        const probe = new Httpgd(url.host, token, true);
-                        try {
-                            await probe.connect();
-                        } catch {
-                            void vscode.window.showWarningMessage('No active shared plot server.');
-                            return;
-                        } finally {
-                            probe.disconnect();
-                        }
-                    } catch {
-                        void vscode.window.showWarningMessage('No active shared plot server.');
-                        return;
-                    }
-                    await this.showViewer(this.lastPlotUrl, this.lastPlotPid);
-                    return;
-                }
-                for (const viewers of this.recentlyActiveViewers.values()) {
-                    viewers.forEach(v => v.show(true));
-                }
-            })();
+            void this.showViewersForActiveSession();
             return;
         } else if (command === 'openUrl') {
             void this.openUrl();
@@ -567,18 +591,20 @@ export class HttpgdViewer implements IHttpgdViewer {
         if (!isGuest() || this.guestConnectionTimer) {
             return;
         }
-        this.guestConnectionTimer = setInterval(async () => {
-            try {
-                await this.api.updatePlots();
-            } catch (error) {
-                console.error('[HttpgdViewer] guest connection lost', error);
-                if (this.guestConnectionTimer) {
-                    clearInterval(this.guestConnectionTimer);
-                    this.guestConnectionTimer = undefined;
+        this.guestConnectionTimer = setInterval(() => {
+            void (async () => {
+                try {
+                    await this.api.updatePlots();
+                } catch (error) {
+                    console.error('[HttpgdViewer] guest connection lost', error);
+                    if (this.guestConnectionTimer) {
+                        clearInterval(this.guestConnectionTimer);
+                        this.guestConnectionTimer = undefined;
+                    }
+                    this.dispose();
+                    this.parent.dropPid(this.pid ?? '__guest__');
                 }
-                this.dispose();
-                this.parent.dropPid(this.pid ?? '__guest__');
-            }
+            })();
         }, 5000);
     }
 
@@ -940,8 +966,8 @@ export class HttpgdViewer implements IHttpgdViewer {
     }
 
     protected makeNewWebview(
-      showOptions?: ShowOptions,
-      titleSuffix?: string
+        showOptions?: ShowOptions,
+        titleSuffix?: string
     ): vscode.WebviewPanel {
         const title = titleSuffix ? `R Plot (${titleSuffix})` : 'R Plot';
         const webviewPanel = vscode.window.createWebviewPanel(

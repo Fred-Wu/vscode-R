@@ -10,8 +10,8 @@ import { docProvider, docScheme } from './virtualDocs';
 
 // Workspace Vars
 let guestPid: string;
-let guestAttached: boolean = false;
-let guestAttachRequested: boolean = false;
+let guestAttached = false;
+let guestAttachRequested = false;
 export let guestWorkspace: WorkspaceData | undefined;
 export let guestResDir: string;
 let rVer: string;
@@ -214,8 +214,7 @@ export async function updateGuestRequest(file: string, force: boolean = false): 
                 }
                 if (request.source && request.type && request.title && request.file
                     && request.viewer !== undefined) {
-                    await showDataView(request.source,
-                        request.type, request.title, request.file, request.viewer, request.dataview_uuid);
+                    await showDataView(request.source, request.type, request.title, request.file, request.viewer, request.dataview_uuid, request.pid ? String(request.pid) : guestPid);
                 }
                 break;
             }

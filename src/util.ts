@@ -639,18 +639,6 @@ export function readFileSyncSafe(
     }
 }
 
-// Tries to read a dir, returns undefined if an error occurs (e.g. the dir does not exist)
-export function readdirSyncSafe(
-    path: fs.PathLike,
-    encoding: BufferEncoding = 'utf-8'
-){
-    try {
-        return fs.readdirSync(path, {encoding: encoding});
-    } catch (e) {
-        return undefined;
-    }
-}
-
 export function statSyncSafe(path: fs.PathLike): fs.Stats | undefined {
     try {
         return fs.statSync(path, { throwIfNoEntry: false });

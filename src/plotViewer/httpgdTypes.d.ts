@@ -6,8 +6,6 @@ import * as vscode from 'vscode';
 import { HttpgdManager } from '.';
 import { PreviewPlotLayout } from './webviewMessages';
 
-export type MaybePromise<T> = T | Promise<T>;
-
 export interface HttpgdPlot<T> {
 
     // unique ID for this plot (w.r.t. this connection/device)

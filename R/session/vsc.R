@@ -747,12 +747,55 @@ removeTaskCallback("vsc.plot")
 use_httpgd <- identical(getOption("vsc.use_httpgd", FALSE), TRUE)
 show_plot <- !identical(getOption("vsc.plot", "Two"), FALSE)
 if (use_httpgd && "httpgd" %in% .packages(all.available = TRUE)) {
+    httpgd_plot_updated <- FALSE
+
+    is_httpgd_dev <- function() {
+        names(dev.cur()) %in% c("httpgd", "unigd")
+    }
+
+    request_httpgd <- function() {
+        tryCatch({
+            if (length(httpgd::hgd_details()) > 0) {
+                .vsc$request("httpgd", url = httpgd::hgd_url())
+            }
+        }, error = message)
+    }
+
+    new_httpgd_plot <- function(...) {
+        if (is_httpgd_dev()) {
+            httpgd_plot_updated <<- TRUE
+        }
+    }
+
     options(device = function(...) {
         httpgd::hgd(
             silent = TRUE
         )
-        .vsc$request("httpgd", url = httpgd::hgd_url())
+        request_httpgd()
     })
+
+    update_httpgd_plot <- function(...) {
+        tryCatch({
+            if (httpgd_plot_updated && is_httpgd_dev()) {
+                httpgd_plot_updated <<- FALSE
+                request_httpgd()
+            }
+        }, error = message)
+        TRUE
+    }
+
+    setHook("plot.new", new_httpgd_plot, "replace")
+    setHook("grid.newpage", new_httpgd_plot, "replace")
+
+    rebind(".External.graphics", function(...) {
+        out <- .Primitive(".External.graphics")(...)
+        if (is_httpgd_dev()) {
+            httpgd_plot_updated <<- TRUE
+        }
+        out
+    }, "base")
+
+    addTaskCallback(update_httpgd_plot, name = "vsc.plot")
 } else if (use_httpgd) {
     message("Install package `httpgd` to use vscode-R with httpgd!")
 } else if (show_plot) {
