@@ -16,6 +16,9 @@
 ### Maintenance
 
 * Removed confirmed unused TypeScript helpers, imports, and stale help viewer CRAN parsing code.
+* Removed the bundled npm `node` dependency so build scripts use the environment-provided Node.js runtime.
+* Removed the deprecated npm `crypto` shim; the extension uses Node.js' built-in `crypto` module.
+* Updated in-range development dependency lockfile entries while leaving `ag-grid-community` unchanged.
 * Tightened release tag handling to version-shaped tags and removed deprecated GitHub Actions `set-output` usage.
 
 ## 3.0.6 - 2026-03-17
