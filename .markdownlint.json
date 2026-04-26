@@ -3,5 +3,8 @@
       "allowed_elements": [ "details", "summary", "br" ]
     },
     "line-length": false,
+    "no-duplicate-heading": {
+      "siblings_only": true
+    },
     "no-trailing-punctuation": false
 }

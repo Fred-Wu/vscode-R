@@ -117,8 +117,8 @@ dataview_table <- local({
              metadata_only = FALSE, force = FALSE) {
 
         if (!is.data.frame(data) && !is.matrix(data) &&
-            !inherits(data, "ArrowTabular") &&
-            !inherits(data, "polars_data_frame")) {
+                !inherits(data, "ArrowTabular") &&
+                !inherits(data, "polars_data_frame")) {
             stop("data must be a data frame, a matrix or an arrow table object.")
         }
 
