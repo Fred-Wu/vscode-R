@@ -4,7 +4,7 @@
 import * as vscode from 'vscode';
 import * as cheerio from 'cheerio';
 
-import { CodeClickConfig, HelpFile, RHelp } from '.';
+import { CodeClickConfig, codeClickConfigDefault, HelpFile, RHelp } from '.';
 import { setContext, UriIcon, config, asViewColumn } from '../util';
 import { runTextInTerm } from '../rTerminal';
 import { OutMessage } from './webviewMessages';
@@ -337,16 +337,16 @@ export class HelpPanel {
             const isNormalClick = !isCtrlClick && !isShiftClick;
 
             // Check wheter to copy or run the code (or both or none)
-            const codeClickConfig = config().get<CodeClickConfig>('helpPanel.clickCodeExamples');
+            const codeClickConfig = config().get<CodeClickConfig>('helpPanel.clickCodeExamples', codeClickConfigDefault);
             const runCode = (
-                isCtrlClick && codeClickConfig?.['Ctrl+Click'] === 'Run'
-                || isShiftClick && codeClickConfig?.['Shift+Click'] === 'Run'
-                || isNormalClick && codeClickConfig?.['Click'] === 'Run'
+                isCtrlClick && codeClickConfig['Ctrl+Click'] === 'Run'
+                || isShiftClick && codeClickConfig['Shift+Click'] === 'Run'
+                || isNormalClick && codeClickConfig['Click'] === 'Run'
             );
             const copyCode = (
-                isCtrlClick && codeClickConfig?.['Ctrl+Click'] === 'Copy'
-                || isShiftClick && codeClickConfig?.['Shift+Click'] === 'Copy'
-                || isNormalClick && codeClickConfig?.['Click'] === 'Copy'
+                isCtrlClick && codeClickConfig['Ctrl+Click'] === 'Copy'
+                || isShiftClick && codeClickConfig['Shift+Click'] === 'Copy'
+                || isNormalClick && codeClickConfig['Click'] === 'Copy'
             );
 
             // Execute action:

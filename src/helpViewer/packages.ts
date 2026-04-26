@@ -382,9 +382,9 @@ function parseIndexFile(html: string): IndexEntry[] {
 
     // loop over all tables on document and each row as one index entry
     // assumes that the provided html is from a valid index file
-    tables.each((tableIndex, table) => {
+    tables.each((_, table) => {
         const rows = $('tr', table);
-        rows.each((rowIndex, row) => {
+        rows.each((_, row) => {
             const elements = $('td', row);
             if(elements.length === 2){
                 const e0 = elements[0];

@@ -7,7 +7,7 @@ import { updateGuestRequest, updateGuestWorkspace, updateGuestPlot, detachGuest,
 import { forwardCommands, shareWorkspace } from './shareTree';
 
 import { runTextInTerm } from '../rTerminal';
-import { requestFile, WorkspaceData, sessionRequest, server } from '../session';
+import { WorkspaceData, sessionRequest, server } from '../session';
 import { HelpFile } from '../helpViewer';
 import { globalHttpgdManager, globalRHelp } from '../extension';
 

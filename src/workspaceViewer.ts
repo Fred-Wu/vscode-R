@@ -4,7 +4,7 @@ import { TreeDataProvider, EventEmitter, TreeItemCollapsibleState, TreeItem, Eve
 import { runTextInTerm } from './rTerminal';
 import { workspaceData, workingDir, WorkspaceData, GlobalEnv } from './session';
 import { config } from './util';
-import { isGuestSession, isLiveShare, UUID, guestWorkspace } from './liveShare';
+import { isGuestSession, guestWorkspace } from './liveShare';
 import { extensionContext, globalRHelp } from './extension';
 import { PackageNode } from './helpViewer/treeView';
 
@@ -106,7 +106,7 @@ export class WorkspaceDataProvider implements TreeDataProvider<TreeItem> {
             } else if (element instanceof GlobalEnvItem) {
                 return element.str
                     .split('\n')
-                    .filter((elem, index) => { return index > 0; })
+                    .filter((_, index) => { return index > 0; })
                     .map(strItem =>
                         new GlobalEnvItem(
                             '',

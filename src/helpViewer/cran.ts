@@ -7,11 +7,6 @@ type ParseFunction = (html: string, baseUrl: string) => Package[];
 
 export async function getPackagesFromCran(cranUrl: string): Promise<Package[]> {
     const cranSites: {url: string, parseFunction: ParseFunction}[] = [
-        // NOTE: Not working any more
-        // {
-        //     url: new URL('stats/descriptions', cranUrl).toString(),
-        //     parseFunction: parseCranJson
-        // },
         {
             url: new URL('web/packages/available_packages_by_date.html', cranUrl).toString(),
             parseFunction: parseCranTable
@@ -56,21 +51,6 @@ function parseCranPackagesFile(html: string): Package[] {
     return packages;
 }
 
-function parseCranJson(jsonString: string): Package[] {
-    const lines = jsonString.split('\n').filter(v => v);
-    const pkgs = lines.map(line => {
-        const j = JSON.parse(line) as {[key: string]: string};
-        const pkg: Package = {
-            name: j['Package'],
-            description: j['Title'],
-            date: j['modified'],
-            isCran: true
-        };
-        return pkg;
-    });
-    return pkgs;
-}
-
 function parseCranTable(html: string, baseUrl: string): Package[] {
     if(!html){
         return [];
@@ -81,10 +61,12 @@ function parseCranTable(html: string, baseUrl: string): Package[] {
 
     // loop over all tables on document and each row as one index entry
     // assumes that the provided html is from a valid index file
-    tables.each((tableIndex, table) => {
+    tables.each((_, table) => {
         const rows = $('tr', table);
         rows.each((rowIndex, row) => {
-            if (rowIndex === 0) return; // Skip the header row
+            if (rowIndex === 0) {
+                return;
+            }
             const date = $(row).find('td:nth-child(1)').text().trim();
             const href = $(row).find('td:nth-child(2) a').attr('href');
             const url = href ? new URL(href, baseUrl).toString() : undefined;

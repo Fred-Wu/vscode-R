@@ -23,7 +23,7 @@ export let rGuestService: GuestService | undefined = undefined;
 export let liveSession: vsls.LiveShare;
 export let isGuestSession: boolean;
 export let _sessionStatusBarItem: vscode.StatusBarItem;
-let guestCommandRegistered: boolean = false;
+let guestCommandRegistered = false;
 
 // service vars
 export const ShareProviderName = 'vscode-r';
@@ -372,7 +372,7 @@ export class GuestService {
     }
     public async requestDataViewRows(args: unknown): Promise<unknown> {
         if (this._isStarted) {
-            return liveShareRequest(Callback.RequestDataViewRows, args);
+            return await liveShareRequest(Callback.RequestDataViewRows, args);
         }
         return undefined;
     }

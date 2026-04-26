@@ -146,7 +146,7 @@ export class RLocalHelpPreviewer {
             this.cachedPackageInfo = undefined;
             this.callPreviewListener();
         };
-        const manDirListener: fs.WatchListener<string | null> = (event: fs.WatchEventType, filename: string | null) => {
+        const manDirListener: fs.WatchListener<string | null> = (_event: fs.WatchEventType, filename: string | null) => {
             if(this.isDisposed){
                 return;
             }

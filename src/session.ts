@@ -180,6 +180,10 @@ export function attachActive(): void {
     }
 }
 
+export function getAttachedPid(): string | undefined {
+    return pid;
+}
+
 export function removeDirectory(dir: string): void {
     console.info(`[removeDirectory] dir: ${dir}`);
     if (fs.existsSync(dir)) {
@@ -440,9 +444,10 @@ export async function showWebView(file: string, title: string, viewer: string | 
     console.info('[showWebView] Done');
 }
 
-export async function showDataView(source: string, type: string, title: string, file: string, viewer: string, dataview_uuid?: string): Promise<void> {
+export async function showDataView(source: string, type: string, title: string, file: string, viewer: string, dataview_uuid?: string, pidArg?: string): Promise<void> {
+    const displayTitle = pidArg ? `${title} (${pidArg})` : title;
     console.info(`[showDataView] source: ${source}, type: ${type}, title: ${title}, file: ${file}, 
-                 viewer: ${viewer}, dataview_uuid: ${String(dataview_uuid)}`);
+                 viewer: ${viewer}, dataview_uuid: ${String(dataview_uuid)}, pid: ${String(pidArg)}`);
 
     if (isGuestSession) {
         resDir = guestResDir;
@@ -455,7 +460,7 @@ export async function showDataView(source: string, type: string, title: string, 
         // Panel might have been closed, check if it's still valid
         if (panel) {
             try {
-                panel.title = title;
+                panel.title = displayTitle;
                 panel.reveal(ViewColumn[viewer as keyof typeof ViewColumn]);
                 
                 await panel?.webview.postMessage({ command: 'refreshDataview' });
@@ -470,7 +475,7 @@ export async function showDataView(source: string, type: string, title: string, 
 
     if (!panel) {
         if (source === 'table' || source === 'list') {
-            panel = window.createWebviewPanel('dataview', title,
+            panel = window.createWebviewPanel('dataview', displayTitle,
                 {
                     preserveFocus: true,
                     viewColumn: ViewColumn[viewer as keyof typeof ViewColumn],
@@ -1173,9 +1178,7 @@ async function updateRequest(sessionStatusBarItem: StatusBarItem) {
 
                         purgeAddinPickerItems();
                         await setContext('rSessionActive', true);
-                        if (request.plot_url) {
-                            globalHttpgdManager?.setLastPlot(request.plot_url, pid);
-                        }
+                        await globalHttpgdManager?.handleAttachedPlot(request.plot_url, pid);
                         void watchProcess(pid).then((v: string) => {
                             globalHttpgdManager?.dropPid(v);
                             void cleanupSession(v);
@@ -1204,8 +1207,8 @@ async function updateRequest(sessionStatusBarItem: StatusBarItem) {
                     case 'dataview': {
                         if (request.source && request.type && request.file && request.title && request.viewer !== undefined) {
                             // Use dataview_uuid for panel tracking, preserve uuid for LiveShare
-                            await showDataView(request.source,
-                                request.type, request.title, request.file, request.viewer, request.dataview_uuid);
+                            const requestPid = request.pid ? String(request.pid) : pid;
+                            await showDataView(request.source, request.type, request.title, request.file, request.viewer, request.dataview_uuid, requestPid);
                         }
                         break;
                     }
@@ -1239,7 +1242,7 @@ export async function cleanupSession(pidArg: string): Promise<void> {
             rHostService?.orderGuestDetach();
         }
         globalHttpgdManager?.dropPid(pid);
-        globalHttpgdManager?.clearLastPlot();
+        globalHttpgdManager?.clearLastPlot(pid);
         disposeDataViewPanels();
         if (!isLiveShare()) {
             await closeSessionViewers();

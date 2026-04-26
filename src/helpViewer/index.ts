@@ -32,7 +32,7 @@ export interface CodeClickConfig {
     'Shift+Click': CodeClickAction,
 }
 const CODE_CLICKS: (keyof CodeClickConfig)[] = ['Click', 'Ctrl+Click', 'Shift+Click'];
-export const codeClickConfigDefault = {
+export const codeClickConfigDefault: CodeClickConfig = {
     'Click': 'Copy',
     'Ctrl+Click': 'Run',
     'Shift+Click': 'Ignore',
@@ -719,12 +719,12 @@ function pimpMyHelp(helpFile: HelpFile): HelpFile {
         });
 
         // Split code examples at empty lines:
-        const codeClickConfig = config().get<CodeClickConfig>('helpPanel.clickCodeExamples');
-        const isEnabled = CODE_CLICKS.some(k => codeClickConfig?.[k] !== 'Ignore');
+        const codeClickConfig = config().get<CodeClickConfig>('helpPanel.clickCodeExamples', codeClickConfigDefault);
+        const isEnabled = CODE_CLICKS.some(k => codeClickConfig[k] !== 'Ignore');
         if(isEnabled){
             $('body').addClass('preClickable');
             const codeSections = $('pre');
-            codeSections.each((i, section) => {
+            codeSections.each((_, section) => {
                 const innerHtml = $(section).html();
                 if(!innerHtml){
                     return;
@@ -734,7 +734,7 @@ function pimpMyHelp(helpFile: HelpFile): HelpFile {
                 $(section).replaceWith(newHtml);
             });
         }
-        if(codeClickConfig?.Click !== 'Ignore'){
+        if(codeClickConfig.Click !== 'Ignore'){
             $('body').addClass('preHoverPointer');
         }
 
@@ -744,7 +744,7 @@ function pimpMyHelp(helpFile: HelpFile): HelpFile {
             const codeSections = $('pre');
 
             // apply syntax highlighting to each code section:
-            codeSections.each((i, section) => {
+            codeSections.each((_, section) => {
                 const styledCode = hljs.default.highlight($(section).text() || '', {
                     language: 'r',
                 });
