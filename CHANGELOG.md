@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.0.8 - 2026-06-08
+
+### Bug Fixes
+
+* Fixed console submission lag when the workspace contains many or large objects by delaying workspace inspection until after command submission.
+* Fixed nested expansion in the workspace viewer for lists, environments, pairlists, S4 objects, and data frames.
+* Improved workspace viewer performance by loading object items on demand. Expanding an object shows the first 500 items directly, and selecting the ellipsis row loads the next 500.
+
+### Maintenance
+
+* Removed the obsolete `r.session.objectLengthLimit` and `r.session.objectTimeout` settings.
+* Removed confirmed unused workspace viewer code.
+
 ## 3.0.7 - 2026-04-26
 
 ### Bug Fixes
