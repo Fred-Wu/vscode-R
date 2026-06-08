@@ -2,7 +2,7 @@
   "name": "r",
   "displayName": "R",
   "description": "R Extension for Visual Studio Code",
-  "version": "3.0.7",
+  "version": "3.0.8",
   "author": "REditorSupport",
   "license": "SEE LICENSE IN LICENSE",
   "publisher": "REditorSupport",
@@ -1645,16 +1645,6 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Watch the global environment to provide hover, autocompletions, and workspace viewer information. Changes the option `vsc.globalenv` in R. Requires `#r.sessionWatcher#` to be set to `true`."
-        },
-        "r.session.objectLengthLimit": {
-          "type": "integer",
-          "default": 2000,
-          "markdownDescription": "The upper limit of object length to show object details in workspace viewer and provide session symbol completion. Decrease this value if you experience significant delay after executing R commands caused by large global objects with many elements. Changes the option `vsc.object_length_limit` in R. Requires `#r.sessionWatcher#` to be set to `true`."
-        },
-        "r.session.objectTimeout": {
-          "type": "integer",
-          "default": 50,
-          "markdownDescription": "The maximum number of milliseconds to get information of a single object in the global environment. Decrease this value if you experience significant delay after executing R commands caused by large global objects with many elements. Changes the option `vsc.object_timeout` in R. Requires `#r.sessionWatcher#` to be set to `true`."
         },
         "r.session.levelOfObjectDetail": {
           "type": "string",

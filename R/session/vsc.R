@@ -31,8 +31,6 @@ load_settings <- function() {
         vsc.show_object_size = workspaceViewer$showObjectSize,
         vsc.rstudioapi = session$emulateRStudioAPI,
         vsc.str.max.level = setting(session$levelOfObjectDetail, Minimal = 0, Normal = 1, Detailed = 2),
-        vsc.object_length_limit = session$objectLengthLimit,
-        vsc.object_timeout = session$objectTimeout,
         vsc.globalenv = session$watchGlobalEnvironment,
         vsc.plot = setting(session$viewers$viewColumn$plot, Disable = FALSE),
         vsc.dev.args = plot$devArgs,

@@ -23,7 +23,7 @@ interface WorkspaceChild {
     selector?: WorkspaceSelector;
 }
 
-export interface WorkspaceSelector {
+interface WorkspaceSelector {
     kind: 'index' | 'name' | 'slot';
     value: number | string;
 }
