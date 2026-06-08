@@ -65,7 +65,8 @@ if (is.null(getOption("help_type"))) {
     options(help_type = "html")
 }
 
-use_webserver <- isTRUE(getOption("vsc.use_webserver", FALSE))
+use_webserver <- isTRUE(getOption("vsc.use_webserver", FALSE)) ||
+    isTRUE(getOption("vsc.globalenv", TRUE))
 
 get_column_def <- function(name, field, value) {
     filter <- TRUE
@@ -483,6 +484,14 @@ if (use_webserver) {
                 file <- tempfile(tmpdir = tempdir, fileext = ".json")
                 jsonlite::write_json(meta, file, na = "string", null = "null", auto_unbox = TRUE, force = TRUE)
                 list(file = file)
+            },
+
+            workspace = function(...) {
+                workspace_data()
+            },
+
+            workspace_children = function(name, path = list(), start = 1L, ...) {
+                workspace_child_page(name, path, start)
             }
         )
 
@@ -549,7 +558,7 @@ if (use_webserver) {
             options(vsc.server = server)
         }
     } else {
-        message("{httpuv} is required to use WebServer from the session watcher.")
+        message("{httpuv} is required to use the session request server.")
         use_webserver <- FALSE
     }
 }
@@ -575,14 +584,6 @@ request <- function(command, ...) {
         auto_unbox = TRUE, null = "null", force = TRUE
     )
     cat(get_timestamp(), file = request_lock_file)
-}
-
-try_catch_timeout <- function(expr, timeout = Inf, ...) {
-    expr <- substitute(expr)
-    envir <- parent.frame()
-    setTimeLimit(timeout, transient = TRUE)
-    on.exit(setTimeLimit())
-    tryCatch(eval(expr, envir), ...)
 }
 
 capture_str <- function(object, max.level = getOption("vsc.str.max.level", 0)) {
@@ -629,24 +630,40 @@ address <- function(x) {
 
 globalenv_cache <- new.env(parent = emptyenv())
 
+workspace_child_count <- function(obj) {
+    if (is.environment(obj)) {
+        length(obj)
+    } else if (isS4(obj)) {
+        length(slotNames(obj))
+    } else if (typeof(obj) %in% c("list", "pairlist")) {
+        length(obj)
+    } else {
+        0L
+    }
+}
+
 inspect_env <- function(env, cache) {
-    all_names <- ls(env)
-    rm(list = setdiff(names(globalenv_cache), all_names), envir = cache)
-    is_active <- vapply(all_names, bindingIsActive, logical(1), USE.NAMES = TRUE, env)
-    is_promise <- rlang::env_binding_are_lazy(env, all_names[!is_active])
+    all_names <- ls(env, sorted = FALSE)
+    stale_names <- setdiff(names(cache), all_names)
+    if (length(stale_names)) {
+        rm(list = stale_names, envir = cache)
+    }
+    is_active <- vapply(all_names, bindingIsActive, logical(1), USE.NAMES = FALSE, env)
+    is_promise <- rep(FALSE, length(all_names))
+    if (any(!is_active)) {
+        is_promise[!is_active] <- rlang::env_binding_are_lazy(env, all_names[!is_active])
+    }
     show_object_size <- getOption("vsc.show_object_size", FALSE)
-    object_length_limit <- getOption("vsc.object_length_limit", 2000)
-    object_timeout <- getOption("vsc.object_timeout", 50) / 1000
-    str_max_level <- getOption("vsc.str.max.level", 0)
-    objs <- lapply(all_names, function(name) {
-        if (isTRUE(is_promise[name])) {
+    objs <- lapply(seq_along(all_names), function(i) {
+        name <- all_names[[i]]
+        if (isTRUE(is_promise[[i]])) {
             info <- list(
                 class = "promise",
                 type = scalar("promise"),
                 length = scalar(0L),
                 str = scalar("(promise)")
             )
-        } else if (isTRUE(is_active[name])) {
+        } else if (isTRUE(is_active[[i]])) {
             info <- list(
                 class = "active_binding",
                 type = scalar("active_binding"),
@@ -655,11 +672,16 @@ inspect_env <- function(env, cache) {
             )
         } else {
             obj <- env[[name]]
+            obj_class <- class(obj)
+            obj_type <- typeof(obj)
+            obj_length <- length(obj)
+            obj_dim <- dim(obj)
+            first_class <- if (length(obj_class)) obj_class[[1]] else obj_type
 
             info <- list(
-                class = class(obj),
-                type = scalar(typeof(obj)),
-                length = scalar(length(obj))
+                class = obj_class,
+                type = scalar(obj_type),
+                length = scalar(obj_length)
             )
 
             if (show_object_size) {
@@ -675,24 +697,18 @@ inspect_env <- function(env, cache) {
                 info$size <- scalar(cobj$size)
             }
 
-            if (length(obj) > object_length_limit) {
+            if (!is.null(obj_dim)) {
+                info$str <- scalar(paste0(first_class, ": ", paste(obj_dim, collapse = " x ")))
+            } else if (obj_type == "environment") {
+                info$str <- scalar("<environment>")
+            } else if (obj_type == "closure" || obj_type == "builtin") {
                 info$str <- scalar(trimws(try_capture_str(obj, 0)))
             } else {
-                info_str <- NULL
-                if (str_max_level > 0) {
-                    info_str <- try_catch_timeout(
-                        capture_str(obj, str_max_level),
-                        timeout = object_timeout,
-                        error = function(e) NULL
-                    )
-                }
-                if (is.null(info_str)) {
-                    info_str <- try_capture_str(obj, 0)
-                }
-                info$str <- scalar(trimws(info_str))
+                info$str <- scalar(paste0(first_class, ", length ", obj_length))
             }
 
-            # Always get names for autocomplete (fast, even for large objects)
+            info$has_children <- scalar(workspace_child_count(obj) > 0L)
+
             obj_names <- if (is.object(obj)) {
                 .DollarNames(obj, pattern = "")
             } else if (is.recursive(obj)) {
@@ -709,8 +725,8 @@ inspect_env <- function(env, cache) {
                 info$slots <- slotNames(obj)
             }
 
-            if (!is.null(dim(obj))) {
-                info$dim <- dim(obj)
+            if (!is.null(obj_dim)) {
+                info$dim <- obj_dim
             }
         }
         info
@@ -724,20 +740,122 @@ dir.create(dir_session, showWarnings = FALSE, recursive = TRUE)
 
 removeTaskCallback("vsc.workspace")
 show_globalenv <- isTRUE(getOption("vsc.globalenv", TRUE))
-workspace_file <- file.path(dir_session, "workspace.json")
 workspace_lock_file <- file.path(dir_session, "workspace.lock")
 file.create(workspace_lock_file, showWarnings = FALSE)
 
-update_workspace <- function(...) {
-    tryCatch({
-        data <- list(
-            search = search()[-1],
-            loaded_namespaces = loadedNamespaces(),
-            globalenv = if (show_globalenv) inspect_env(.GlobalEnv, globalenv_cache) else NULL
+workspace_data <- function() {
+    list(
+        search = search()[-1],
+        loaded_namespaces = loadedNamespaces(),
+        globalenv = if (show_globalenv) inspect_env(.GlobalEnv, globalenv_cache) else NULL
+    )
+}
+
+workspace_object <- function(name, path = list()) {
+    object <- get(name, envir = .GlobalEnv, inherits = FALSE)
+    for (selector in path) {
+        object <- switch(selector$kind,
+            index = object[[as.integer(selector$value)]],
+            name = get(selector$value, envir = object, inherits = FALSE),
+            slot = slot(object, selector$value),
+            stop("Unknown workspace selector")
         )
-        jsonlite::write_json(data, workspace_file, force = TRUE, pretty = FALSE)
-        cat(get_timestamp(), file = workspace_lock_file)
-    }, error = message)
+    }
+    object
+}
+
+workspace_child_page_size <- 500L
+
+workspace_child_item <- function(object, str, selector) {
+    list(
+        str = scalar(str),
+        class = scalar(paste(class(object), collapse = ", ")),
+        type = scalar(typeof(object)),
+        has_children = scalar(workspace_child_count(object) > 0L),
+        selector = selector
+    )
+}
+
+workspace_child_label <- function(name, index) {
+    if (!is.null(name) && !is.na(name) && nzchar(name)) {
+        paste0("$ ", name)
+    } else {
+        paste0("[[", index, "]]")
+    }
+}
+
+workspace_child_page <- function(name, path = list(), start = 1L) {
+    tryCatch({
+        object <- workspace_object(name, path)
+        child_count <- workspace_child_count(object)
+        if (child_count == 0L) {
+            return(list(children = I(list()), next_start = NULL))
+        }
+
+        start <- max(1L, as.integer(start))
+        end <- min(child_count, start + workspace_child_page_size - 1L)
+        if (start > end) {
+            return(list(children = I(list()), next_start = NULL))
+        }
+
+        children <- if (is.environment(object)) {
+            child_names <- ls(object, sorted = FALSE)[seq.int(start, end)]
+            lapply(child_names, function(child_name) {
+                if (bindingIsActive(child_name, object)) {
+                    list(
+                        str = scalar(paste0("$ ", child_name, ": (active-binding)")),
+                        class = scalar("active_binding"),
+                        type = scalar("active_binding"),
+                        has_children = scalar(FALSE)
+                    )
+                } else {
+                    child <- get(child_name, envir = object, inherits = FALSE)
+                    workspace_child_item(
+                        child,
+                        paste0("$ ", child_name, ": ", trimws(try_capture_str(child, 0))),
+                        list(kind = "name", value = child_name)
+                    )
+                }
+            })
+        } else if (isS4(object)) {
+            child_names <- slotNames(object)[seq.int(start, end)]
+            lapply(child_names, function(child_name) {
+                child <- slot(object, child_name)
+                workspace_child_item(
+                    child,
+                    paste0("@ ", child_name, ": ", trimws(try_capture_str(child, 0))),
+                    list(kind = "slot", value = child_name)
+                )
+            })
+        } else if (typeof(object) %in% c("list", "pairlist")) {
+            indices <- seq.int(start, end)
+            child_names <- names(object)
+            lapply(indices, function(index) {
+                child <- object[[index]]
+                child_name <- if (is.null(child_names)) NULL else child_names[[index]]
+                workspace_child_item(
+                    child,
+                    paste0(
+                        workspace_child_label(child_name, index),
+                        ": ",
+                        trimws(try_capture_str(child, 0))
+                    ),
+                    list(kind = "index", value = scalar(index))
+                )
+            })
+        } else {
+            list()
+        }
+
+        list(
+            children = I(children),
+            next_start = if (end < child_count) scalar(end + 1L) else NULL
+        )
+    }, error = function(e) list(children = I(list()), next_start = NULL))
+}
+
+update_workspace <- function(...) {
+    cat(get_timestamp(), file = workspace_lock_file)
     TRUE
 }
 update_workspace()

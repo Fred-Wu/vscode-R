@@ -19,14 +19,15 @@ import { UUID, rHostService, rGuestService, isLiveShare, isHost, isGuestSession,
 
 export interface GlobalEnv {
     [key: string]: {
-        class: string[];
+        class: string[] | string;
         type: string;
         length: number;
         str: string;
         size?: number;
         dim?: number[],
         names?: string[],
-        slots?: string[]
+        slots?: string[],
+        has_children?: boolean
     }
 }
 
@@ -67,7 +68,6 @@ let pid: string;
 let info: any;
 const httpAgent = new Agent({ keepAlive: true });
 export let server: SessionServer | undefined;
-export let workspaceFile: string;
 let workspaceLockFile: string;
 let workspaceTimeStamp: number;
 let plotFile: string;
@@ -75,6 +75,9 @@ let plotLockFile: string;
 let plotTimeStamp: number;
 let workspaceWatcher: FSWatcher;
 let plotWatcher: FSWatcher;
+let workspaceRefreshTimer: NodeJS.Timeout | undefined;
+let workspaceRefreshInProgress = false;
+let workspaceRefreshPending = false;
 let activeBrowserPanel: WebviewPanel | undefined;
 let activeBrowserUri: Uri | undefined;
 let activeBrowserExternalUri: Uri | undefined;
@@ -220,7 +223,6 @@ function writeSettings() {
 function updateSessionWatcher() {
     console.info(`[updateSessionWatcher] PID: ${pid}`);
     console.info('[updateSessionWatcher] Create workspaceWatcher');
-    workspaceFile = path.join(sessionDir, 'workspace.json');
     workspaceLockFile = path.join(sessionDir, 'workspace.lock');
     workspaceTimeStamp = 0;
     if (workspaceWatcher !== undefined) {
@@ -228,9 +230,9 @@ function updateSessionWatcher() {
     }
     if (fs.existsSync(workspaceLockFile)) {
         workspaceWatcher = fs.watch(workspaceLockFile, {}, () => {
-            void updateWorkspace();
+            scheduleWorkspaceRefresh();
         });
-        void updateWorkspace();
+        scheduleWorkspaceRefresh(0);
     } else {
         console.info('[updateSessionWatcher] workspaceLockFile not found');
     }
@@ -276,22 +278,62 @@ async function updatePlot() {
 }
 
 async function updateWorkspace() {
-    console.info(`[updateWorkspace] ${workspaceFile}`);
+    if (!server) {
+        console.info('[updateWorkspace] R server not available');
+        return;
+    }
 
     const lockContent = await fs.readFile(workspaceLockFile, 'utf8');
     const newTimeStamp = Number.parseFloat(lockContent);
+    if (Number.isNaN(newTimeStamp)) {
+        return;
+    }
     if (newTimeStamp !== workspaceTimeStamp) {
         workspaceTimeStamp = newTimeStamp;
-        if (fs.existsSync(workspaceFile)) {
-            const content = await fs.readFile(workspaceFile, 'utf8');
-            workspaceData = JSON.parse(content) as WorkspaceData;
+        const data = await sessionRequest(server, { type: 'workspace' }) as WorkspaceData | undefined;
+        if (data) {
+            workspaceData = data;
             void rWorkspace?.refresh();
             console.info('[updateWorkspace] Done');
             if (isLiveShare()) {
                 rHostService?.notifyWorkspace(workspaceData);
             }
         } else {
-            console.info('[updateWorkspace] File not found');
+            console.info('[updateWorkspace] No workspace data returned');
+        }
+    }
+}
+
+export function deferWorkspaceRefresh(): void {
+    if (workspaceRefreshTimer) {
+        clearTimeout(workspaceRefreshTimer);
+        workspaceRefreshTimer = undefined;
+    }
+}
+
+function scheduleWorkspaceRefresh(delayMs: number = 500): void {
+    workspaceRefreshPending = true;
+    if (workspaceRefreshTimer) {
+        clearTimeout(workspaceRefreshTimer);
+    }
+    workspaceRefreshTimer = setTimeout(() => {
+        workspaceRefreshTimer = undefined;
+        void runWorkspaceRefresh();
+    }, delayMs);
+}
+
+async function runWorkspaceRefresh(): Promise<void> {
+    if (workspaceRefreshInProgress || !workspaceRefreshPending) {
+        return;
+    }
+    workspaceRefreshPending = false;
+    workspaceRefreshInProgress = true;
+    try {
+        await updateWorkspace();
+    } finally {
+        workspaceRefreshInProgress = false;
+        if (workspaceRefreshPending) {
+            scheduleWorkspaceRefresh();
         }
     }
 }
@@ -1170,11 +1212,11 @@ async function updateRequest(sessionStatusBarItem: StatusBarItem) {
                         // eslint-disable-next-line @typescript-eslint/restrict-template-expressions, @typescript-eslint/no-unsafe-member-access
                         sessionStatusBarItem.tooltip = `${info?.version}\nProcess ID: ${pid}\nCommand: ${info?.command}\nStart time: ${info?.start_time}\nClick to attach to active terminal.`;
                         //sessionStatusBarItem.show();  
-                        updateSessionWatcher();
 
                         if (request.server) {
                             server = request.server;
                         }
+                        updateSessionWatcher();
 
                         purgeAddinPickerItems();
                         await setContext('rSessionActive', true);
@@ -1233,6 +1275,11 @@ async function updateRequest(sessionStatusBarItem: StatusBarItem) {
 
 export async function cleanupSession(pidArg: string): Promise<void> {
     if (pid === pidArg) {
+        if (workspaceRefreshTimer) {
+            clearTimeout(workspaceRefreshTimer);
+            workspaceRefreshTimer = undefined;
+        }
+        workspaceRefreshPending = false;
         if (sessionStatusBarItem) {
             sessionStatusBarItem.text = 'R: (not attached)';
             sessionStatusBarItem.tooltip = 'Click to attach active terminal.';

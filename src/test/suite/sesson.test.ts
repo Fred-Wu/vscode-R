@@ -52,4 +52,55 @@ suite('Workspace Viewer', () => {
         const env: workspace.GlobalEnvItem[] = await workspaceViewer.getChildren(nodes[2]) as workspace.GlobalEnvItem[];
         assert.strictEqual(env.length, 9);
     });
+
+    test('supported workspace objects show arrows when they have children', () => {
+        const types = ['list', 'environment', 'pairlist', 'S4', 'list'];
+        const classes = ['list', 'environment', 'pairlist', 'PlainS4', 'data.frame'];
+
+        for (const [index, type] of types.entries()) {
+            const item = new workspace.GlobalEnvItem(
+                classes[index],
+                classes[index],
+                `${classes[index]}, length 1`,
+                type,
+                0,
+                0,
+                undefined,
+                true
+            );
+            assert.strictEqual(item.collapsibleState, vscode.TreeItemCollapsibleState.Collapsed);
+        }
+
+        const emptyList = new workspace.GlobalEnvItem(
+            'empty',
+            'list',
+            'list, length 0',
+            'list',
+            0,
+            0,
+            undefined,
+            false
+        );
+        assert.strictEqual(emptyList.collapsibleState, vscode.TreeItemCollapsibleState.None);
+    });
+
+    test('nested list child remains expandable', () => {
+        const item = new workspace.GlobalEnvItem(
+            '',
+            'list',
+            '$ a: List of 2',
+            'list',
+            0,
+            1,
+            undefined,
+            true,
+            'test',
+            [{ kind: 'index', value: 1 }]
+        );
+
+        assert.strictEqual(item.collapsibleState, vscode.TreeItemCollapsibleState.Collapsed);
+        assert.strictEqual(item.rootName, 'test');
+        assert.deepStrictEqual(item.objectPath, [{ kind: 'index', value: 1 }]);
+    });
+
 });
