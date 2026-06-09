@@ -1646,21 +1646,6 @@
           "default": true,
           "markdownDescription": "Watch the global environment to provide hover, autocompletions, and workspace viewer information. Changes the option `vsc.globalenv` in R. Requires `#r.sessionWatcher#` to be set to `true`."
         },
-        "r.session.levelOfObjectDetail": {
-          "type": "string",
-          "markdownDescription": "How much of the object to show on hover, autocompletion, and in the workspace viewer? Changes the option `vsc.str.max.level` in R. Requires `#r.sessionWatcher#` to be set to `true`.",
-          "default": "Minimal",
-          "enum": [
-            "Minimal",
-            "Normal",
-            "Detailed"
-          ],
-          "enumDescriptions": [
-            "Display literal values and object types only.",
-            "Display the top level of list content, data frame column values, and example values.",
-            "Display the top two levels of list content, data frame column values, and example values. This option may cause notable delay after each user input in the terminal."
-          ]
-        },
         "r.session.emulateRStudioAPI": {
           "type": "boolean",
           "default": true,

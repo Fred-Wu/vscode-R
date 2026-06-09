@@ -30,7 +30,6 @@ load_settings <- function() {
         vsc.use_httpgd = plot$useHttpgd,
         vsc.show_object_size = workspaceViewer$showObjectSize,
         vsc.rstudioapi = session$emulateRStudioAPI,
-        vsc.str.max.level = setting(session$levelOfObjectDetail, Minimal = 0, Normal = 1, Detailed = 2),
         vsc.globalenv = session$watchGlobalEnvironment,
         vsc.plot = setting(session$viewers$viewColumn$plot, Disable = FALSE),
         vsc.dev.args = plot$devArgs,

@@ -10,8 +10,8 @@
 
 ### Maintenance
 
-* Removed the obsolete `r.session.objectLengthLimit` and `r.session.objectTimeout` settings.
-* Removed confirmed unused workspace viewer code.
+* Removed the obsolete `r.session.objectLengthLimit`, `r.session.objectTimeout`, and `r.session.levelOfObjectDetail` settings.
+* Removed the legacy string-based expansion fallback now that expandable objects provide explicit metadata.
 
 ## 3.0.7 - 2026-04-26
 
