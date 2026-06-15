@@ -84,7 +84,12 @@ let activeBrowserExternalUri: Uri | undefined;
 
 // Add a map to track dataview panels by UUID
 const dataviewPanels = new Map<string, WebviewPanel>();
-const dataviewPanelInfo = new Map<WebviewPanel, { title: string; source: string }>();
+const dataviewPanelInfo = new Map<WebviewPanel, {
+    title: string;
+    source: string;
+    viewId: string;
+    generation?: number;
+}>();
 let activeDataViewPanel: WebviewPanel | undefined;
 
 export function disposeDataViewPanels(): void {
@@ -443,7 +448,8 @@ export async function refreshDataViewPanel(): Promise<void> {
     try {
         const response: unknown = await sessionRequest(server, {
             type: 'dataview_refresh',
-            varname: info.title
+            varname: info.title,
+            view_id: info.viewId
         });
         if (typeof response !== 'object' || response === null || !('file' in response)) {
             throw new Error('Invalid response from R server');
@@ -453,9 +459,12 @@ export async function refreshDataViewPanel(): Promise<void> {
             throw new Error('Invalid file path from R server');
         }
         const content = await getTableHtml(panel.webview, file);
+        const generation: unknown = (response as { generation?: number }).generation;
+        if (typeof generation === 'number') {
+            info.generation = generation;
+        }
         panel.webview.html = '';
         panel.webview.html = content;
-        await panel?.webview.postMessage({ command: 'initAgGridRequestMap' });
     } catch (error) {
         console.error('[refreshDataViewPanel] Error:', error);
         void window.showErrorMessage('Failed to refresh data viewer.');
@@ -486,7 +495,8 @@ export async function showWebView(file: string, title: string, viewer: string | 
     console.info('[showWebView] Done');
 }
 
-export async function showDataView(source: string, type: string, title: string, file: string, viewer: string, dataview_uuid?: string, pidArg?: string): Promise<void> {
+export async function showDataView(source: string, type: string, title: string, file: string, viewer: string,
+    dataview_uuid?: string, dataview_generation?: number, pidArg?: string): Promise<void> {
     const displayTitle = pidArg ? `${title} (${pidArg})` : title;
     console.info(`[showDataView] source: ${source}, type: ${type}, title: ${title}, file: ${file}, 
                  viewer: ${viewer}, dataview_uuid: ${String(dataview_uuid)}, pid: ${String(pidArg)}`);
@@ -555,7 +565,8 @@ export async function showDataView(source: string, type: string, title: string, 
 
     if (panel) {
         const panelRef = panel;
-        dataviewPanelInfo.set(panelRef, { title, source });
+        const viewId = dataview_uuid ?? title;
+        dataviewPanelInfo.set(panelRef, { title, source, viewId, generation: dataview_generation });
         const panelState = panelRef as PanelWithFetchFlag;
         if (!panelState._hasViewStateHandler) {
             panelRef.onDidChangeViewState((event: WebviewPanelOnDidChangeViewStateEvent) => {
@@ -568,6 +579,14 @@ export async function showDataView(source: string, type: string, title: string, 
                 }
             });
             panelRef.onDidDispose(() => {
+                const disposedInfo = dataviewPanelInfo.get(panelRef);
+                if (disposedInfo?.source === 'table' && server && !isGuestSession && !isLiveShare()) {
+                    void sessionRequest(server, {
+                        type: 'dataview_dispose',
+                        view_id: disposedInfo.viewId,
+                        generation: disposedInfo.generation
+                    });
+                }
                 dataviewPanelInfo.delete(panelRef);
                 if (activeDataViewPanel === panelRef) {
                     activeDataViewPanel = undefined;
@@ -587,12 +606,13 @@ export async function showDataView(source: string, type: string, title: string, 
     if (panel && !p._hasFetchHandler) {
         panel.webview.onDidReceiveMessage(async (message: WebviewMessage & {
           requestId?: string;
+          generation?: number;
           sortModel?: Array<{ colId: string; sort: 'asc' | 'desc' }>;
           filterModel?: {[colId: string]: unknown};
         }) => {
             if (message.command === 'fetchRows') {
                 try {
-                    const { start, end, sortModel, filterModel, requestId } = message;
+                    const { start, end, generation, sortModel, filterModel, requestId } = message;
                     
                     console.log('[fetchRows] Sending to R:', {varname: title, start, end, sortModel, filterModel});
                     
@@ -603,9 +623,11 @@ export async function showDataView(source: string, type: string, title: string, 
                     const response: unknown = await sessionRequest(server, {
                         type: 'dataview_fetch_rows',
                         varname: title,
+                        view_id: dataview_uuid ?? title,
                         start,
                         end,
-                        sortModel, 
+                        generation,
+                        sortModel,
                         filterModel
                     });
                     
@@ -613,32 +635,33 @@ export async function showDataView(source: string, type: string, title: string, 
                         response === null || 
                         !('rows' in response) || 
                         !('totalRows' in response) ||
-                        !('totalUnfiltered' in response)) {
+                        !('totalUnfiltered' in response) ||
+                        !('generation' in response)) {
                         throw new Error('Invalid response from R server');
                     }
                     
                     const rows: unknown = (response as {rows: object[]}).rows;
                     const totalRows: unknown = (response as {totalRows: number}).totalRows;
                     const totalUnfiltered: unknown = (response as {totalUnfiltered: number}).totalUnfiltered;
+                    const responseGeneration: unknown = (response as {generation: number}).generation;
                     
-                    if (!Array.isArray(rows) || typeof totalRows !== 'number') {
+                    if (!Array.isArray(rows) || typeof totalRows !== 'number' ||
+                        typeof totalUnfiltered !== 'number' || typeof responseGeneration !== 'number') {
                         throw new Error('Fetched rows or totalRows invalid');
                     }
                     
                     await panel?.webview.postMessage({
                         command: 'fetchedRows',
-                        start,
-                        end,
                         rows: rows as object[],
                         totalRows,
                         totalUnfiltered,
+                        generation: responseGeneration,
                         requestId
                     });
                 } catch (error) {
                     console.error('[fetchRows] Error:', error);
                     await panel?.webview.postMessage({
                         command: 'fetchError',
-                        error: String(error),
                         requestId: message.requestId
                     });
                 }
@@ -651,7 +674,6 @@ export async function showDataView(source: string, type: string, title: string, 
         if (source === 'table') {
             const content = await getTableHtml(panel.webview, file);
             panel.webview.html = content;
-            await panel?.webview.postMessage({ command: 'initAgGridRequestMap' });
         } else if (source === 'list') {
             const content = await getListHtml(panel.webview, file);
             panel.webview.html = content;
@@ -814,12 +836,12 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
     const data = ${content};
 
     const displayDataSource = {
-        rowCount: undefined,
         getRows(params) {
             const msg = {
                 command: 'fetchRows',
                 start: params.startRow,
                 end: params.endRow,
+                generation: data.generation,
                 sortModel: params.sortModel,
                 filterModel: params.filterModel,
                 requestId: Math.random().toString(36).substr(2, 9)
@@ -827,7 +849,18 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
             
             const handler = event => {
                 const m = event.data;
-                if (m.command === 'fetchedRows' && m.requestId === msg.requestId) {
+                if (m.requestId !== msg.requestId) {
+                    return;
+                }
+
+                if (m.command === 'fetchedRows') {
+                    if (m.generation !== msg.generation) {
+                        const overlay = document.getElementById('loadingOverlay');
+                        if (overlay) overlay.classList.add('hidden');
+                        params.failCallback();
+                        window.removeEventListener('message', handler);
+                        return;
+                    }
             
                     if (!hasReceivedFirstRows) {
                         hasReceivedFirstRows = true;
@@ -840,10 +873,14 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
                     displayDataSource.api?.refreshHeader();
 
                     const totalRows = m.totalRows;
-                    let lastRow = totalRows <= params.endRow ? totalRows : -1;
-                    params.successCallback(m.rows, lastRow);
+                    params.successCallback(m.rows, totalRows);
                     window.removeEventListener('message', handler);
-                } 
+                } else if (m.command === 'fetchError') {
+                    const overlay = document.getElementById('loadingOverlay');
+                    if (overlay) overlay.classList.add('hidden');
+                    params.failCallback();
+                    window.removeEventListener('message', handler);
+                }
             };
             window.addEventListener('message', handler);
             vscode.postMessage(msg);
@@ -856,7 +893,8 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
             ...col,
             valueFormatter: params =>
               params.value === true ? 'TRUE' :
-              params.value === false ? 'FALSE' : ''
+              params.value === false ? 'FALSE' :
+              params.value === 'NA' ? 'NA' : params.value
           };
         } else if (col.type === "dateColumn") {
           return { ...col, width: 200 };
@@ -905,7 +943,7 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
 
         suppressColumnVirtualisation: false,
         alwaysShowVerticalScroll: true,
-        debounceVerticalScrollbar: true,
+        debounceVerticalScrollbar: false,
         
         ensureDomOrder: true,
         rowHeight: 25,
@@ -914,19 +952,14 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
         maxBlocksInCache: 100,
         infiniteInitialRowCount: 100,           // Show 100 placeholder rows
         cacheOverflowSize: 2,
-        maxConcurrentDatasourceRequests: 1,     // Critical for performance!
-        blockLoadDebounceMillis: 500,           // Prevent flooding R
+        maxConcurrentDatasourceRequests: 2,
+        blockLoadDebounceMillis: 0,
         
-        rowBuffer: 10,
+        rowBuffer: 50,
         rowSelection: 'multiple',
         enableCellTextSelection: true,
         suppressRowTransform: true,
-        animateRows: false,
-        
-        onSortChanged: params => params.api.purgeInfiniteCache(),
-        onFilterChanged: params => {
-            params.api.purgeInfiniteCache();
-        }
+        animateRows: false
       };
     
     function updateTheme() {
@@ -1163,12 +1196,6 @@ export async function writeSuccessResponse(responseSessionDir: string): Promise<
     await writeResponse({ result: true }, responseSessionDir);
 }
 
-type ISessionRequest = {
-    plot_url?: string,
-    server?: SessionServer,
-    dataview_uuid?: string  // Add this property to match the R code
-} & IRequest;
-
 async function updateRequest(sessionStatusBarItem: StatusBarItem) {
     console.info('[updateRequest] Started');
     console.info(`[updateRequest] requestFile: ${requestFile}`);
@@ -1179,7 +1206,7 @@ async function updateRequest(sessionStatusBarItem: StatusBarItem) {
         requestTimeStamp = newTimeStamp;
         const requestContent = await fs.readFile(requestFile, 'utf8');
         console.info(`[updateRequest] request: ${requestContent}`);
-        const request = JSON.parse(requestContent) as ISessionRequest;
+        const request = JSON.parse(requestContent) as IRequest;
         if (request.wd && isFromWorkspace(request.wd)) {
             if (request.uuid === null || request.uuid === undefined || String(request.uuid) === String(UUID)) {
                 switch (request.command) {
@@ -1250,7 +1277,8 @@ async function updateRequest(sessionStatusBarItem: StatusBarItem) {
                         if (request.source && request.type && request.file && request.title && request.viewer !== undefined) {
                             // Use dataview_uuid for panel tracking, preserve uuid for LiveShare
                             const requestPid = request.pid ? String(request.pid) : pid;
-                            await showDataView(request.source, request.type, request.title, request.file, request.viewer, request.dataview_uuid, requestPid);
+                            await showDataView(request.source, request.type, request.title, request.file, request.viewer,
+                                request.dataview_uuid, request.dataview_generation, requestPid);
                         }
                         break;
                     }

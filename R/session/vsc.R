@@ -66,7 +66,6 @@ use_webserver <- isTRUE(getOption("vsc.use_webserver", FALSE)) ||
     isTRUE(getOption("vsc.globalenv", TRUE))
 
 get_column_def <- function(name, field, value) {
-    filter <- TRUE
     tooltip <- sprintf(
         "%s, class: [%s], type: %s",
         name,
@@ -76,9 +75,6 @@ get_column_def <- function(name, field, value) {
     if (is.numeric(value)) {
         type <- "numericColumn"
         filter <- "agNumberColumnFilter"
-        if (is.null(attr(value, "class"))) {
-            filter <- "agNumberColumnFilter"
-        }
     } else if (inherits(value, "Date")
                || inherits(value, "POSIXct")
                || inherits(value, "POSIXlt")) {
@@ -100,193 +96,363 @@ get_column_def <- function(name, field, value) {
     )
 }
 
-dataview_table <- local({
-    cache_raw_dt       <- NULL
-    cache_filtered_dt  <- NULL
-    cache_dt           <- NULL
-    cache_nrow         <- NULL
-    cache_colnames     <- NULL
-    cache_fields       <- NULL
-    last_fm            <- NULL
-    last_sm            <- NULL
+dataview_is_table <- function(data) {
+    is.data.frame(data) || is.matrix(data) ||
+        inherits(data, "ArrowTabular") ||
+        inherits(data, "polars_data_frame")
+}
 
-    function(data, start = 0, end = NULL,
-             sortModel = NULL, filterModel = NULL,
-             metadata_only = FALSE, force = FALSE) {
+dataview_schema <- function(data) {
+    if (inherits(data, "ArrowTabular")) {
+        return(data[0, ]$to_data_frame())
+    }
+    if (inherits(data, "polars_data_frame")) {
+        return(as.data.frame(data[0, ]))
+    }
+    data[0, , drop = FALSE]
+}
 
-        if (!is.data.frame(data) && !is.matrix(data) &&
-                !inherits(data, "ArrowTabular") &&
-                !inherits(data, "polars_data_frame")) {
-            stop("data must be a data frame, a matrix or an arrow table object.")
+dataview_slice <- function(data, rows) {
+    if (inherits(data, "ArrowTabular")) {
+        if (!length(rows)) {
+            return(data[0, ]$to_data_frame())
         }
+        return(data[rows, ]$to_data_frame())
+    }
+    if (inherits(data, "polars_data_frame")) {
+        return(as.data.frame(data[rows, ]))
+    }
+    data[rows, , drop = FALSE]
+}
 
-        key <- attr(data, "_dvkey", exact = TRUE)
-        if (is.null(key)) key <- "<default>"
+dataview_column <- function(data, position) {
+    if (inherits(data, "ArrowTabular")) {
+        return(as.vector(data[[position]]))
+    }
+    if (inherits(data, "polars_data_frame")) {
+        return(as.data.frame(data[, position])[[1]])
+    }
+    if (is.matrix(data)) {
+        return(data[, position])
+    }
+    data[[position]]
+}
 
-        # Metadata capture
-        .nrow     <- nrow(data)
-        .colnames <- colnames(data)
-        if (is.null(.colnames)) {
-            .colnames <- sprintf("V%d", seq_len(ncol(data)))
+dataview_text_values <- function(values) {
+    if (is.character(values) || is.factor(values)) {
+        return(as.character(values))
+    }
+    if (is.list(values)) {
+        return(vapply(values, function(value) {
+            tryCatch(
+                paste(format(value), collapse = " "),
+                error = function(e) paste0("<", paste(class(value), collapse = ", "), ">")
+            )
+        }, character(1)))
+    }
+    tryCatch(
+        as.character(values),
+        error = function(e) {
+            vapply(seq_along(values), function(index) {
+                paste(format(values[index]), collapse = " ")
+            }, character(1))
+        }
+    )
+}
+
+dataview_sort_values <- function(values) {
+    if (is.list(values) && !inherits(values, "POSIXlt")) {
+        return(dataview_text_values(values))
+    }
+    tryCatch({
+        xtfrm(values)
+        values
+    }, error = function(e) dataview_text_values(values))
+}
+
+dataview_format_page <- function(page) {
+    if (!is.data.frame(page)) {
+        return(page)
+    }
+    for (position in seq_len(ncol(page))) {
+        column <- page[[position]]
+        if (is.list(column) &&
+                !inherits(column, "POSIXlt")) {
+            page[[position]] <- dataview_text_values(column)
+        }
+    }
+    page
+}
+
+dataview_filter_condition <- function(values, condition) {
+    op <- condition$type
+    if (is.null(op)) {
+        return(rep(TRUE, length(values)))
+    }
+
+    text_values <- NULL
+    blank <- function() {
+        if (is.character(values) || is.factor(values) || is.list(values)) {
+            text_values <<- dataview_text_values(values)
+            is.na(values) | text_values == ""
         } else {
-            .colnames <- trimws(.colnames)
+            is.na(values)
         }
-        fields    <- sprintf("x%d", seq_len(length(.colnames) + 2))
-        full_cols <- c("(row)", "rowId", .colnames)
-        field_map <- setNames(full_cols, fields)
+    }
+
+    if (op == "blank") {
+        return(blank())
+    }
+    if (op == "notBlank") {
+        return(!blank())
+    }
+
+    if (inherits(values, "Date") ||
+            inherits(values, "POSIXct") ||
+            inherits(values, "POSIXlt")) {
+        values <- as.Date(values)
+        low <- as.Date(if (is.null(condition$dateFrom)) condition$filter else condition$dateFrom)
+        high <- as.Date(if (is.null(condition$dateTo)) condition$filterTo else condition$dateTo)
+    } else if (inherits(values, "integer64") &&
+                   requireNamespace("bit64", quietly = TRUE)) {
+        low <- bit64::as.integer64(as.character(condition$filter))
+        high <- bit64::as.integer64(as.character(condition$filterTo))
+    } else if (is.numeric(values) || is.logical(values)) {
+        values <- as.numeric(values)
+        low <- suppressWarnings(as.numeric(condition$filter))
+        high <- suppressWarnings(as.numeric(condition$filterTo))
+    } else {
+        values <- tolower(dataview_text_values(values))
+        low <- tolower(as.character(condition$filter))
+        high <- NULL
+    }
+
+    result <- switch(op,
+        equals             = values == low,
+        notEqual           = values != low,
+        greaterThan        = values > low,
+        greaterThanOrEqual = values >= low,
+        lessThan           = values < low,
+        lessThanOrEqual    = values <= low,
+        contains           = grepl(low, values, fixed = TRUE),
+        notContains        = !grepl(low, values, fixed = TRUE),
+        startsWith         = startsWith(values, low),
+        endsWith           = endsWith(values, low),
+        regexp             = grepl(low, values),
+        inRange            = values >= low & values <= high,
+        rep(TRUE, length(values))
+    )
+    result[is.na(result)] <- FALSE
+    result
+}
+
+dataview_filter_values <- function(values, model) {
+    conditions <- model$conditions
+    if (is.null(conditions) && !is.null(model$condition1)) {
+        conditions <- Filter(Negate(is.null), list(model$condition1, model$condition2))
+    }
+    if (is.null(conditions) || !length(conditions)) {
+        return(dataview_filter_condition(values, model))
+    }
+
+    matches <- lapply(conditions, function(condition) {
+        dataview_filter_condition(values, condition)
+    })
+    if (identical(toupper(model$operator), "OR")) {
+        Reduce(`|`, matches)
+    } else {
+        Reduce(`&`, matches)
+    }
+}
+
+dataview_field_position <- function(field, column_count) {
+    position <- suppressWarnings(as.integer(sub("^x", "", field))) - 2L
+    if (is.na(position) || position < 1L || position > column_count) {
+        return(NA_integer_)
+    }
+    position
+}
+
+dataview_query_key <- function(sortModel, filterModel) {
+    if (is.null(sortModel) || !length(sortModel)) {
+        sortModel <- NULL
+    }
+    if (is.null(filterModel) || !length(filterModel)) {
+        filterModel <- NULL
+    }
+    jsonlite::toJSON(
+        list(sortModel = sortModel, filterModel = filterModel),
+        auto_unbox = TRUE,
+        null = "null",
+        force = TRUE
+    )
+}
+
+dataview_query_indices <- function(state, sortModel, filterModel) {
+    row_indices <- NULL
+    if (!is.null(filterModel) && length(filterModel)) {
+        matches <- rep(TRUE, state$total_unfiltered)
+        for (field in names(filterModel)) {
+            position <- dataview_field_position(field, state$column_count)
+            if (is.na(position)) {
+                next
+            }
+            values <- dataview_column(state$data, position)
+            matches <- matches & dataview_filter_values(values, filterModel[[field]])
+        }
+        row_indices <- which(matches)
+    }
+
+    if (!is.null(sortModel) && length(sortModel)) {
+        if (is.null(row_indices)) {
+            row_indices <- seq_len(state$total_unfiltered)
+        }
+
+        sort_values <- list()
+        decreasing <- logical()
+        for (sort_item in sortModel) {
+            position <- dataview_field_position(sort_item$colId, state$column_count)
+            if (is.na(position)) {
+                next
+            }
+            values <- dataview_column(state$data, position)[row_indices]
+            sort_values[[length(sort_values) + 1L]] <- dataview_sort_values(values)
+            decreasing <- c(decreasing, identical(sort_item$sort, "desc"))
+        }
+
+        if (length(sort_values)) {
+            # The source row index is the deterministic tie-breaker.
+            sort_values[[length(sort_values) + 1L]] <- row_indices
+            decreasing <- c(decreasing, FALSE)
+            args <- c(sort_values, list(
+                na.last = TRUE,
+                decreasing = decreasing,
+                method = "radix"
+            ))
+            row_indices <- row_indices[do.call(order, args)]
+        }
+    }
+
+    row_indices
+}
+
+dataview_table <- local({
+    cache <- new.env(parent = emptyenv())
+
+    register <- function(data, key) {
+        if (!dataview_is_table(data)) {
+            stop("data must be a data frame, a matrix, an arrow table or a polars data frame.")
+        }
+
+        column_names <- colnames(data)
+        if (is.null(column_names)) {
+            column_names <- sprintf("V%d", seq_len(ncol(data)))
+        } else {
+            column_names <- trimws(column_names)
+        }
+        fields <- sprintf("x%d", seq_len(length(column_names) + 2L))
+        full_names <- c("(row)", "rowId", column_names)
+        schema <- dataview_schema(data)
+        schema_columns <- c(
+            list(integer(), integer()),
+            lapply(seq_len(ncol(schema)), function(position) {
+                dataview_column(schema, position)
+            })
+        )
+        previous <- cache[[key]]
+        generation <- if (is.null(previous)) 1L else previous$generation + 1L
+
+        state <- list(
+            data = data,
+            column_count = length(column_names),
+            columns = .mapply(
+                get_column_def,
+                list(full_names, fields, schema_columns),
+                NULL
+            ),
+            fields = fields,
+            total_unfiltered = nrow(data),
+            generation = generation,
+            query_key = NULL,
+            query_indices = NULL
+        )
+        cache[[key]] <- state
+        state
+    }
+
+    function(data = NULL, start = 0, end = NULL,
+             sortModel = NULL, filterModel = NULL,
+             metadata_only = FALSE, force = FALSE,
+             key = "<default>", generation = NULL,
+             dispose = FALSE) {
+
+        state <- cache[[key]]
+        if (dispose) {
+            if (!is.null(generation) &&
+                    !is.null(state) &&
+                    !identical(as.integer(generation), state$generation)) {
+                return(invisible(FALSE))
+            }
+            cache[[key]] <- NULL
+            return(invisible(TRUE))
+        }
+        if (force || is.null(state)) {
+            state <- register(data, key)
+        }
+
+        if (!is.null(generation) && !identical(as.integer(generation), state$generation)) {
+            stop("stale data viewer request")
+        }
 
         if (metadata_only) {
-            meta_data <- data.table::as.data.table(data[0, , drop = FALSE])
-            meta_data[, `:=`("(row)" = numeric(), rowId = integer())]
-            data.table::setcolorder(meta_data, neworder = c("(row)", "rowId"), before = 1)
-            columns <- .mapply(
-                get_column_def,
-                list(full_cols, fields, meta_data),
-                NULL
-            )
             return(list(
-                columns = columns,
-                rows = list()
+                columns = state$columns,
+                generation = state$generation
             ))
         }
 
-        if (is.null(cache_raw_dt[[key]]) || force) {
-            cache_raw_dt[[key]] <<- data.table::as.data.table(data)
-            cache_raw_dt[[key]][, `:=`("(row)" = numeric(), rowId = .I)]
-            data.table::setcolorder(cache_raw_dt[[key]], neworder = c("(row)", "rowId"), before = 1)
-
-            cache_filtered_dt[[key]]  <<- NULL
-            cache_dt[[key]]           <<- NULL
-            cache_nrow[[key]]         <<- .nrow
-            cache_colnames[[key]]     <<- full_cols
-            cache_fields[[key]]       <<- fields
-            last_fm[[key]]            <<- NULL
-            last_sm[[key]]            <<- NULL
+        query_key <- dataview_query_key(sortModel, filterModel)
+        if (!identical(query_key, state$query_key)) {
+            state$query_key <- query_key
+            state$query_indices <- dataview_query_indices(state, sortModel, filterModel)
+            cache[[key]] <- state
         }
 
-        if (is.null(cache_filtered_dt[[key]]) || !identical(filterModel, last_fm[[key]])) {
-
-            dt1 <- cache_raw_dt[[key]]
-
-            if (!is.null(filterModel) && length(filterModel) > 0) {
-                filter_strings <- lapply(names(filterModel), function(fld) {
-                    fd  <- filterModel[[fld]]
-                    col_name <- field_map[[fld]]
-
-                    is_date <- inherits(dt1[[col_name]], "Date") ||
-                        inherits(dt1[[col_name]], "POSIXct") ||
-                        inherits(dt1[[col_name]], "POSIXlt")
-
-                    col <- if (is_date) {
-                        sprintf("as.Date(%s)", col_name)
-                    } else {
-                        col_name
-                    }
-                    if (!is.null(fd$type) && !is.null(fd$filter)) {
-                        op  <- fd$type
-                        raw <- if (fd$filterType == "date") fd$dateFrom else fd$filter
-                        lit <- if (is_date) {
-                            sprintf('as.Date("%s")', raw)
-                        } else if (is.numeric(dt1[[col_name]])) {
-                            as.numeric(raw)
-                        } else if (is.logical(dt1[[col_name]])) {
-                            as.logical(raw)
-                        } else {
-                            sprintf('"%s"', gsub('"', '\\\"', raw))
-                        }
-                        expr <- switch(op,
-                            equals               = sprintf("%s == %s", col, lit),
-                            notEqual             = sprintf("%s != %s", col, lit),
-                            greaterThan          = sprintf("%s > %s", col, lit),
-                            greaterThanOrEqual   = sprintf("%s >= %s", col, lit),
-                            lessThan             = sprintf("%s < %s", col, lit),
-                            lessThanOrEqual      = sprintf("%s <= %s", col, lit),
-                            contains             = sprintf("grepl(%s, %s, fixed=TRUE)", lit, col),
-                            notContains          = sprintf("!grepl(%s, %s, fixed=TRUE)", lit, col),
-                            startsWith           = sprintf("startsWith(%s, %s)", col, lit),
-                            endsWith             = sprintf("endsWith(%s, %s)", col, lit),
-                            regexp               = sprintf("grepl(%s, %s)", lit, col),
-                            blank  = if (is_date) {
-                                sprintf("is.na(%s)", col)
-                            } else {
-                                sprintf('is.na(%s) | %s == ""', col, col)
-                            },
-                            notBlank = if (is_date) {
-                                sprintf("!is.na(%s)", col)
-                            } else {
-                                sprintf('!is.na(%s) & %s != ""', col, col)
-                            },
-                            inRange = {
-                                hi <- if (is_date && !is.null(fd$dateTo)) {
-                                    sprintf('as.Date("%s")', fd$dateTo)
-                                } else {
-                                    as.numeric(fd$filterTo)
-                                }
-                                sprintf("%s >= %s & %s <= %s", col, lit, col, hi)
-                            },
-                            NULL
-                        )
-                        return(expr)
-                    }
-                    NULL
-                })
-                filter_strings <- Filter(Negate(is.null), filter_strings)
-                if (length(filter_strings) > 0) {
-                    combined <- paste(filter_strings, collapse = " & ")
-                    dt1 <- dt1[eval(parse(text = combined))]
-                }
-            }
-            cache_filtered_dt[[key]] <<- dt1
-        }
-
-        if (is.null(cache_dt[[key]])
-            || !identical(sortModel, last_sm[[key]])
-            || !identical(filterModel, last_fm[[key]])) {
-
-            dt2 <- cache_filtered_dt[[key]]
-            if (!is.null(sortModel) && length(sortModel) > 0) {
-                cols <- vapply(sortModel, function(s) field_map[[s$colId]], FUN.VALUE = "")
-                ords <- vapply(sortModel, function(s) if (s$sort == "asc") 1L else -1L, FUN.VALUE = integer(1))
-                sorted <- data.table::copy(dt2)
-                data.table::setorderv(sorted, cols, order = ords)
-            } else {
-                sorted <- dt2
-            }
-
-            cache_dt[[key]]           <<- sorted
-            last_sm[[key]]            <<- sortModel
-            last_fm[[key]]            <<- filterModel
-        }
-
-        # Fetch rows
-        out_dt           <- cache_dt[[key]]
-        totalUnfiltered  <- cache_nrow[[key]]
-        totalRows        <- nrow(out_dt)
-
-        if (is.null(end)) end <- totalRows
-        s <- max(1L, as.integer(start) + 1)
-        e <- min(totalRows, as.integer(end))
-
-        if (s > totalRows || e < 1 || s > e) {
-            rows <- out_dt[0]
+        total_rows <- if (is.null(state$query_indices)) {
+            state$total_unfiltered
         } else {
-            rows <- out_dt[s:e]
-            rows[, "(row)" := seq.int(s, e)]
+            length(state$query_indices)
+        }
+        if (is.null(end)) {
+            end <- total_rows
+        }
+        first <- max(1L, as.integer(start) + 1L)
+        last <- min(total_rows, as.integer(end))
+
+        if (first > total_rows || last < 1L || first > last) {
+            source_rows <- integer()
+            display_rows <- integer()
+        } else {
+            display_rows <- seq.int(first, last)
+            source_rows <- if (is.null(state$query_indices)) {
+                display_rows
+            } else {
+                state$query_indices[display_rows]
+            }
         }
 
-        names(rows) <- cache_fields[[key]]
-
-        columns <- .mapply(
-            get_column_def,
-            list(cache_colnames[[key]], cache_fields[[key]], rows),
-            NULL
+        page <- dataview_format_page(dataview_slice(state$data, source_rows))
+        rows <- cbind(
+            data.frame(display_rows, source_rows, check.names = FALSE),
+            page
         )
+        names(rows) <- state$fields
 
         list(
-            columns         = columns,
-            rows            = rows,
-            totalRows       = totalRows,
-            totalUnfiltered = totalUnfiltered
+            rows = rows,
+            totalRows = total_rows,
+            totalUnfiltered = state$total_unfiltered,
+            generation = state$generation
         )
     }
 })
@@ -353,53 +519,42 @@ if (use_webserver) {
                     return(result)
                 }
             },
-            dataview_fetch_rows = function(varname, start, end, sortModel, filterModel, ...) {
-
-                if (!exists(".dataview_first_map", envir = .GlobalEnv, inherits = FALSE)) {
-                    assign(".dataview_first_map", new.env(parent = emptyenv()), envir = .GlobalEnv)
-                }
-                fm_env <- get(".dataview_first_map", envir = .GlobalEnv)
-
-                obj <- NULL
-                if (exists(".vsc_env_view_cache", envir = .GlobalEnv, inherits = FALSE)) {
-                    cache_env <- get(".vsc_env_view_cache", envir = .GlobalEnv)
-                    if (!is.null(cache_env[[varname]])) {
-                        obj <- cache_env[[varname]]
-                    }
-                }
-                if (is.null(obj)) {
-                    obj <- if (exists(varname, envir = .GlobalEnv)) {
-                        get(varname, envir = .GlobalEnv)
-                    } else {
-                        eval(parse(text = varname), envir = .GlobalEnv)
-                    }
-                }
-
-                attr(obj, "_dvkey") <- varname
-
-                is_first <- is.null(fm_env[[varname]])
-                fm_env[[varname]] <- TRUE
-
-                out <- dataview_table(obj, start, end, sortModel, filterModel, force = is_first)
-                out$columns <- NULL
-                return(out)
+            dataview_fetch_rows = function(varname, start, end, sortModel, filterModel,
+                                           generation = NULL, view_id = NULL, ...) {
+                dataview_table(
+                    start = start,
+                    end = end,
+                    sortModel = sortModel,
+                    filterModel = filterModel,
+                    key = if (is.null(view_id)) varname else view_id,
+                    generation = generation
+                )
             },
-            dataview_refresh = function(varname, ...) {
-                if (!exists(".dataview_first_map", envir = .GlobalEnv, inherits = FALSE)) {
-                    assign(".dataview_first_map", new.env(parent = emptyenv()), envir = .GlobalEnv)
+            dataview_dispose = function(view_id, generation = NULL, ...) {
+                disposed <- dataview_table(key = view_id, generation = generation, dispose = TRUE)
+                if (isTRUE(disposed) &&
+                        exists("dataview_sources", inherits = FALSE) &&
+                        exists(view_id, envir = dataview_sources, inherits = FALSE)) {
+                    rm(list = view_id, envir = dataview_sources)
                 }
-                fm_env <- get(".dataview_first_map", envir = .GlobalEnv)
-                fm_env[[varname]] <- NULL
+                invisible(disposed)
+            },
+            dataview_refresh = function(varname, view_id = NULL, ...) {
                 if (exists(".vsc_env_view_cache", envir = .GlobalEnv, inherits = FALSE)) {
                     cache_env <- get(".vsc_env_view_cache", envir = .GlobalEnv)
                     cache_env[[varname]] <- NULL
                 }
 
-                obj <- if (exists(varname, envir = .GlobalEnv)) {
-                    get(varname, envir = .GlobalEnv)
+                source <- if (!is.null(view_id) &&
+                                  exists(view_id, envir = dataview_sources, inherits = FALSE)) {
+                    get(view_id, envir = dataview_sources, inherits = FALSE)
                 } else {
-                    eval(parse(text = varname), envir = .GlobalEnv)
+                    list(
+                        expression = parse(text = varname)[[1L]],
+                        environment = .GlobalEnv
+                    )
                 }
+                obj <- eval(source$expression, envir = source$environment)
 
                 if (is.environment(obj)) {
                     all_names <- ls(obj)
@@ -464,23 +619,19 @@ if (use_webserver) {
                     cache_env[[varname]] <- obj
                 }
 
-                if (inherits(obj, "ArrowTabular")) {
-                    obj <- obj[1, ]$to_data_frame()
+                if (!dataview_is_table(obj)) {
+                    stop("dataview_refresh expects a table object.")
                 }
 
-                if (inherits(obj, "polars_data_frame")) {
-                    obj <- as.data.frame(obj[0, ])
-                }
-
-                if (!is.data.frame(obj) && !is.matrix(obj)) {
-                    stop("dataview_refresh expects a data.frame or matrix.")
-                }
-
-                attr(obj, "_dvkey") <- varname
-                meta <- dataview_table(obj, start = 0, end = 0, force = TRUE)
+                meta <- dataview_table(
+                    obj,
+                    metadata_only = TRUE,
+                    force = TRUE,
+                    key = if (is.null(view_id)) varname else view_id
+                )
                 file <- tempfile(tmpdir = tempdir, fileext = ".json")
                 jsonlite::write_json(meta, file, na = "string", null = "null", auto_unbox = TRUE, force = TRUE)
-                list(file = file)
+                list(file = file, generation = meta$generation)
             },
 
             workspace = function(...) {
@@ -546,7 +697,16 @@ if (use_webserver) {
                             headers = list(
                                 "Content-Type" = "application/json"
                             ),
-                            body = jsonlite::toJSON(response, auto_unbox = TRUE, force = TRUE)
+                            body = jsonlite::toJSON(
+                                response,
+                                auto_unbox = TRUE,
+                                force = TRUE,
+                                na = if (identical(request$type, "dataview_fetch_rows")) {
+                                    "string"
+                                } else {
+                                    "null"
+                                }
+                            )
                         )
                     }
                 )
@@ -980,13 +1140,15 @@ if (use_httpgd && "httpgd" %in% .packages(all.available = TRUE)) {
 show_view <- !identical(getOption("vsc.view", "Two"), FALSE)
 if (show_view) {
     dataview_registry <- new.env(parent = emptyenv())
+    dataview_sources <- new.env(parent = emptyenv())
 
     show_dataview <- function(x, title, uuid = NULL,
                               viewer = getOption("vsc.view", "Two")) {
 
+        source_expression <- substitute(x)
+        source_environment <- parent.frame()
         if (missing(title)) {
-            sub <- substitute(x)
-            title <- deparse1(sub, nlines = 1)
+            title <- deparse1(source_expression, nlines = 1)
         }
 
         # Generate a unique ID for this dataview based on the title
@@ -998,14 +1160,6 @@ if (show_view) {
             dataview_uuid <- paste0("dataview-", format(Sys.time(), "%Y%m%d%H%M%S"), "-", sample(1000:9999, 1))
             assign(title_key, dataview_uuid, envir = dataview_registry)
             logger("Created new dataview UUID for title:", title, "UUID:", dataview_uuid)
-        }
-
-        if (inherits(x, "ArrowTabular")) {
-            x <- x[1, ]$to_data_frame()
-        }
-
-        if (inherits(x, "polars_data_frame")) {
-            x <- as.data.frame(x[0, ])
         }
 
         if (is.environment(x)) {
@@ -1070,17 +1224,23 @@ if (show_view) {
             cache_env <- get(".vsc_env_view_cache", envir = .GlobalEnv)
             cache_env[[title]] <- x
         }
-        if (is.data.frame(x) || is.matrix(x)) {
-            x <- data.table::as.data.table(x[0, , drop = FALSE])
-            if (exists(".dataview_first_map", envir = .GlobalEnv, inherits = FALSE)) {
-                fm_env        <- get(".dataview_first_map", envir = .GlobalEnv)
-                fm_env[[title]] <- NULL
-            }
-            meta <- dataview_table(x, start = 0, end = 0, metadata_only = TRUE, force = TRUE)
+        if (dataview_is_table(x)) {
+            assign(
+                dataview_uuid,
+                list(expression = source_expression, environment = source_environment),
+                envir = dataview_sources
+            )
+            meta <- dataview_table(
+                x,
+                metadata_only = TRUE,
+                force = TRUE,
+                key = dataview_uuid
+            )
             file <- tempfile(tmpdir = tempdir, fileext = ".json")
             jsonlite::write_json(meta, file, na = "string", null = "null", auto_unbox = TRUE, force = TRUE)
             request("dataview", source = "table", type = "json",
-                title = title, file = file, viewer = viewer, uuid = uuid, dataview_uuid = dataview_uuid
+                title = title, file = file, viewer = viewer, uuid = uuid,
+                dataview_uuid = dataview_uuid, dataview_generation = meta$generation
             )
         } else if (is.list(x)) {
             tryCatch({

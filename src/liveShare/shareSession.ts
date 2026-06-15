@@ -40,6 +40,7 @@ export interface IRequest {
     requestPath?: string;
     uuid?: number;
     dataview_uuid?: string;  // Add this property
+    dataview_generation?: number;
     tempdir?: string;
     version?: string;
     server?: SessionServer;
@@ -214,7 +215,8 @@ export async function updateGuestRequest(file: string, force: boolean = false): 
                 }
                 if (request.source && request.type && request.title && request.file
                     && request.viewer !== undefined) {
-                    await showDataView(request.source, request.type, request.title, request.file, request.viewer, request.dataview_uuid, request.pid ? String(request.pid) : guestPid);
+                    await showDataView(request.source, request.type, request.title, request.file, request.viewer,
+                        request.dataview_uuid, request.dataview_generation, request.pid ? String(request.pid) : guestPid);
                 }
                 break;
             }

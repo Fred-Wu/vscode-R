@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.0.9 - 2026-06-15
+
+### Bug Fixes
+
+* Displayed missing R values as `NA` instead of blank data viewer cells.
+
+### Performance
+
+* Redesigned the existing dynamic data viewer to open large tables from metadata without preparing and copying all rows before the initial display.
+* Improved global filtering and sorting performance while preserving results across the complete table.
+* Improved scrolling responsiveness by reusing the active filter and sort result, prefetching adjacent rows, and removing unnecessary loading delays.
+
 ## 3.0.8 - 2026-06-08
 
 ### Bug Fixes
