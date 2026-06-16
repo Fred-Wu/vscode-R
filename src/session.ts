@@ -89,7 +89,10 @@ const dataviewPanelInfo = new Map<WebviewPanel, {
     source: string;
     viewId: string;
     generation?: number;
+    pid?: string;
+    server?: SessionServer;
 }>();
+const sessionServers = new Map<string, SessionServer>();
 let activeDataViewPanel: WebviewPanel | undefined;
 
 export function disposeDataViewPanels(): void {
@@ -441,12 +444,13 @@ export async function refreshDataViewPanel(): Promise<void> {
         void window.showWarningMessage('Active data viewer cannot be refreshed.');
         return;
     }
-    if (!server && !isGuestSession) {
+    const panelServer = info.server ?? server;
+    if (!panelServer && !isGuestSession) {
         void window.showWarningMessage('R server not available.');
         return;
     }
     try {
-        const response: unknown = await sessionRequest(server, {
+        const response: unknown = await sessionRequest(panelServer, {
             type: 'dataview_refresh',
             varname: info.title,
             view_id: info.viewId
@@ -496,8 +500,10 @@ export async function showWebView(file: string, title: string, viewer: string | 
 }
 
 export async function showDataView(source: string, type: string, title: string, file: string, viewer: string,
-    dataview_uuid?: string, dataview_generation?: number, pidArg?: string): Promise<void> {
+    dataview_uuid?: string, dataview_generation?: number, pidArg?: string,
+    dataviewServer?: SessionServer): Promise<void> {
     const displayTitle = pidArg ? `${title} (${pidArg})` : title;
+    const viewId = dataview_uuid ?? title;
     console.info(`[showDataView] source: ${source}, type: ${type}, title: ${title}, file: ${file}, 
                  viewer: ${viewer}, dataview_uuid: ${String(dataview_uuid)}, pid: ${String(pidArg)}`);
 
@@ -512,6 +518,10 @@ export async function showDataView(source: string, type: string, title: string, 
         // Panel might have been closed, check if it's still valid
         if (panel) {
             try {
+                dataviewPanelInfo.set(panel, {
+                    title, source, viewId, generation: dataview_generation,
+                    pid: pidArg, server: dataviewServer
+                });
                 panel.title = displayTitle;
                 panel.reveal(ViewColumn[viewer as keyof typeof ViewColumn]);
                 
@@ -565,8 +575,10 @@ export async function showDataView(source: string, type: string, title: string, 
 
     if (panel) {
         const panelRef = panel;
-        const viewId = dataview_uuid ?? title;
-        dataviewPanelInfo.set(panelRef, { title, source, viewId, generation: dataview_generation });
+        dataviewPanelInfo.set(panelRef, {
+            title, source, viewId, generation: dataview_generation,
+            pid: pidArg, server: dataviewServer
+        });
         const panelState = panelRef as PanelWithFetchFlag;
         if (!panelState._hasViewStateHandler) {
             panelRef.onDidChangeViewState((event: WebviewPanelOnDidChangeViewStateEvent) => {
@@ -580,8 +592,8 @@ export async function showDataView(source: string, type: string, title: string, 
             });
             panelRef.onDidDispose(() => {
                 const disposedInfo = dataviewPanelInfo.get(panelRef);
-                if (disposedInfo?.source === 'table' && server && !isGuestSession && !isLiveShare()) {
-                    void sessionRequest(server, {
+                if (disposedInfo?.source === 'table' && disposedInfo.server && !isGuestSession && !isLiveShare()) {
+                    void sessionRequest(disposedInfo.server, {
                         type: 'dataview_dispose',
                         view_id: disposedInfo.viewId,
                         generation: disposedInfo.generation
@@ -604,7 +616,8 @@ export async function showDataView(source: string, type: string, title: string, 
     // Register the message handler after panel is created or retrieved, but only once per panel
     const p = panel as PanelWithFetchFlag;
     if (panel && !p._hasFetchHandler) {
-        panel.webview.onDidReceiveMessage(async (message: WebviewMessage & {
+        const panelRef = panel;
+        panelRef.webview.onDidReceiveMessage(async (message: WebviewMessage & {
           requestId?: string;
           generation?: number;
           sortModel?: Array<{ colId: string; sort: 'asc' | 'desc' }>;
@@ -613,23 +626,26 @@ export async function showDataView(source: string, type: string, title: string, 
             if (message.command === 'fetchRows') {
                 try {
                     const { start, end, generation, sortModel, filterModel, requestId } = message;
-                    
-                    console.log('[fetchRows] Sending to R:', {varname: title, start, end, sortModel, filterModel});
-                    
-                    if (!server && !isGuestSession) {
-                        throw new Error('R server not available');
-                    }
-
-                    const response: unknown = await sessionRequest(server, {
+                    const info = dataviewPanelInfo.get(panelRef);
+                    const requestServer = info?.server ?? server;
+                    const request = {
                         type: 'dataview_fetch_rows',
-                        varname: title,
-                        view_id: dataview_uuid ?? title,
+                        varname: info?.title ?? title,
+                        view_id: info?.viewId ?? viewId,
                         start,
                         end,
                         generation,
                         sortModel,
                         filterModel
-                    });
+                    };
+
+                    console.log('[fetchRows] Sending to R:', request);
+
+                    if (!requestServer && !isGuestSession) {
+                        throw new Error('R server not available');
+                    }
+
+                    const response: unknown = await sessionRequest(requestServer, request);
                     
                     if (typeof response !== 'object' || 
                         response === null || 
@@ -650,7 +666,7 @@ export async function showDataView(source: string, type: string, title: string, 
                         throw new Error('Fetched rows or totalRows invalid');
                     }
                     
-                    await panel?.webview.postMessage({
+                    await panelRef.webview.postMessage({
                         command: 'fetchedRows',
                         rows: rows as object[],
                         totalRows,
@@ -660,7 +676,7 @@ export async function showDataView(source: string, type: string, title: string, 
                     });
                 } catch (error) {
                     console.error('[fetchRows] Error:', error);
-                    await panel?.webview.postMessage({
+                    await panelRef.webview.postMessage({
                         command: 'fetchError',
                         requestId: message.requestId
                     });
@@ -1242,6 +1258,7 @@ async function updateRequest(sessionStatusBarItem: StatusBarItem) {
 
                         if (request.server) {
                             server = request.server;
+                            sessionServers.set(pid, request.server);
                         }
                         updateSessionWatcher();
 
@@ -1277,8 +1294,10 @@ async function updateRequest(sessionStatusBarItem: StatusBarItem) {
                         if (request.source && request.type && request.file && request.title && request.viewer !== undefined) {
                             // Use dataview_uuid for panel tracking, preserve uuid for LiveShare
                             const requestPid = request.pid ? String(request.pid) : pid;
+                            const requestServer = sessionServers.get(requestPid) ??
+                                (requestPid === pid ? server : undefined);
                             await showDataView(request.source, request.type, request.title, request.file, request.viewer,
-                                request.dataview_uuid, request.dataview_generation, requestPid);
+                                request.dataview_uuid, request.dataview_generation, requestPid, requestServer);
                         }
                         break;
                     }
@@ -1302,6 +1321,7 @@ async function updateRequest(sessionStatusBarItem: StatusBarItem) {
 }
 
 export async function cleanupSession(pidArg: string): Promise<void> {
+    sessionServers.delete(pidArg);
     if (pid === pidArg) {
         if (workspaceRefreshTimer) {
             clearTimeout(workspaceRefreshTimer);

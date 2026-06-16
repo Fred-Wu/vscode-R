@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.1.0 - 2026-06-16
+
+### Bug Fixes
+
+* Fixed a data viewer issue where only headers appeared and data rows failed to load because `httpuv` row requests could use a stale R session backend.
+
 ## 3.0.9 - 2026-06-15
 
 ### Bug Fixes
@@ -8,7 +14,7 @@
 
 ### Performance
 
-* Redesigned the existing dynamic data viewer to open large tables from metadata without preparing and copying all rows before the initial display.
+* Redesigned the existing dynamic data viewer to open large tables from metadata and fetch rows on demand through the R session's `httpuv` server, without preparing and copying all rows before the initial display.
 * Improved global filtering and sorting performance while preserving results across the complete table.
 * Improved scrolling responsiveness by reusing the active filter and sort result, prefetching adjacent rows, and removing unnecessary loading delays.
 
