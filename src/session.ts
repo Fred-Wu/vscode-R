@@ -859,6 +859,12 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
     #scrollPosition.visible {
         display: block;
     }
+
+    .dataview-na {
+        color: var(--vscode-descriptionForeground);
+        font-style: italic;
+        opacity: 0.75;
+    }
     </style>
     <script src="${String(webview.asWebviewUri(Uri.file(path.join(resDir, 'ag-grid-community.min.noStyle.js'))))}"></script>
     <script>
@@ -891,6 +897,12 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
     // Inject raw JSON data from R
     const data = ${content};
     const emptyCellRenderer = () => '';
+    const naCellRenderer = () => {
+        const element = document.createElement('span');
+        element.className = 'dataview-na';
+        element.textContent = 'NA';
+        return element;
+    };
 
     function clearLongFetchTimer() {
         if (longFetchTimer) {
@@ -1100,6 +1112,14 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
 
     const columnDefs = data.columns.map(sourceColumn => {
         const column = { ...sourceColumn };
+        column.cellRendererSelector = params => {
+            if (params.data == null) {
+                return { component: emptyCellRenderer };
+            }
+            return params.value == null
+                ? { component: naCellRenderer }
+                : undefined;
+        };
         if (column.field === 'x1') {
             column.lockPosition = 'left';
             column.width = 150;
@@ -1112,13 +1132,8 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
             column.hide = true;
         }
 
-        if (column.type === 'booleanColumn') {
-            column.cellRendererSelector = params =>
-                params.data == null
-                    ? { component: emptyCellRenderer }
-                    : undefined;
-        } else if (column.type === 'dateColumn' ||
-                   column.type === 'datetimeColumn') {
+        if (column.type === 'dateColumn' ||
+            column.type === 'datetimeColumn') {
             column.cellDataType =
                 column.type === 'dateColumn' ? 'dateString' : 'dateTimeString';
             column.filter = 'agDateColumnFilter';
