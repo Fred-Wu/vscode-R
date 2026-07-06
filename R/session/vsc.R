@@ -89,7 +89,7 @@ get_column_def <- function(name, field, value) {
         type <- "dateColumn"
         filter <- "agDateColumnFilter"
     } else if (inherits(value, "POSIXct") ||
-               inherits(value, "POSIXlt")) {
+                   inherits(value, "POSIXlt")) {
         type <- "datetimeColumn"
         filter <- "agDateColumnFilter"
     } else if (is.logical(value)) {
@@ -199,8 +199,8 @@ dataview_filter_condition <- function(values, condition) {
     } else if (is.logical(values) && op == "false") {
         result <- !is.na(values) & !values
     } else if (inherits(values, "Date") ||
-            inherits(values, "POSIXct") ||
-            inherits(values, "POSIXlt")) {
+                   inherits(values, "POSIXct") ||
+                   inherits(values, "POSIXlt")) {
         if (inherits(values, "Date")) {
             comparable <- as.Date(values)
             low <- as.Date(if (is.null(condition$dateFrom)) condition$filter else condition$dateFrom)
@@ -418,7 +418,7 @@ dataview_table <- local({
         }
 
         column_names <- if (inherits(data, "ArrowTabular") ||
-                inherits(data, "polars_data_frame")) {
+                                inherits(data, "polars_data_frame")) {
             names(data)
         } else {
             colnames(data)
