@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.2.0 - 2026-07-06
+
+### Bug Fixes
+
+* Improved the R language server lifecycle for Quarto R chunks with delayed shutdown, cancellation of pending shutdowns, serialised restart handling, correct virtual-document routing and selectors, and cleanup of stopped clients and listeners.
+
+### Minor
+
+* Added formatted current-row and total-row feedback while dragging the data viewer's vertical scrollbar.
+
+### Maintenance
+
+* Upgraded AG Grid Community to 35.2.1 and refactored the existing data viewer to use the AG Grid 35 grid and theme APIs.
+* Removed `data.table` as a dependency.
+
 ## 3.1.0 - 2026-06-16
 
 ### Bug Fixes

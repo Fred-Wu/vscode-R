@@ -72,28 +72,58 @@ get_column_def <- function(name, field, value) {
         toString(class(value)),
         typeof(value)
     )
-    if (is.numeric(value)) {
+    units <- attr(value, "units", exact = TRUE)
+    if (!is.null(units)) {
+        tooltip <- sprintf("%s, units: %s", tooltip, toString(units))
+    }
+    if (inherits(value, "integer64")) {
+        if (!requireNamespace("bit64", quietly = TRUE)) {
+            stop("Viewing integer64 columns requires the optional 'bit64' package")
+        }
+        type <- "bigintColumn"
+        filter <- "agBigIntColumnFilter"
+    } else if (is.numeric(value)) {
         type <- "numericColumn"
         filter <- "agNumberColumnFilter"
-    } else if (inherits(value, "Date")
-               || inherits(value, "POSIXct")
-               || inherits(value, "POSIXlt")) {
+    } else if (inherits(value, "Date")) {
         type <- "dateColumn"
+        filter <- "agDateColumnFilter"
+    } else if (inherits(value, "POSIXct") ||
+                   inherits(value, "POSIXlt")) {
+        type <- "datetimeColumn"
         filter <- "agDateColumnFilter"
     } else if (is.logical(value)) {
         type <- "booleanColumn"
-        filter <- "agNumberColumnFilter"
+        filter <- TRUE
     } else {
         type <- "textColumn"
         filter <- "agTextColumnFilter"
     }
-    list(
-        headerName = name,
-        headerTooltip = tooltip,
-        field = field,
-        type = type,
-        filter = filter
+    sortable <- !is.complex(value) &&
+        !(is.list(value) && !inherits(value, "POSIXlt")) &&
+        !is.raw(value)
+    if (field %in% c("x1", "x2")) {
+        sortable <- FALSE
+        filter <- FALSE
+    }
+    if (!sortable) {
+        filter <- FALSE
+    }
+    col_def <- list(
+        headerName = jsonlite::unbox(name),
+        headerTooltip = jsonlite::unbox(tooltip),
+        field = jsonlite::unbox(field),
+        type = jsonlite::unbox(type),
+        filter = jsonlite::unbox(filter),
+        sortable = jsonlite::unbox(sortable)
     )
+    if (is.logical(value)) {
+        col_def$cellDataType <- jsonlite::unbox("boolean")
+    }
+    if (identical(field, "x1")) {
+        col_def$suppressHeaderMenuButton <- jsonlite::unbox(TRUE)
+    }
+    col_def
 }
 
 dataview_is_table <- function(data) {
@@ -104,25 +134,38 @@ dataview_is_table <- function(data) {
 
 dataview_schema <- function(data) {
     if (inherits(data, "ArrowTabular")) {
-        return(data[0, ]$to_data_frame())
+        return(data$Slice(0L, 0L)$to_data_frame())
     }
     if (inherits(data, "polars_data_frame")) {
-        return(as.data.frame(data[0, ]))
+        return(as.data.frame(data$slice(0L, 0L)))
     }
     data[0, , drop = FALSE]
 }
 
-dataview_slice <- function(data, rows) {
+dataview_slice <- function(data, row_idx) {
     if (inherits(data, "ArrowTabular")) {
-        if (!length(rows)) {
-            return(data[0, ]$to_data_frame())
+        if (!length(row_idx)) {
+            return(data$Slice(0L, 0L)$to_data_frame())
         }
-        return(data[rows, ]$to_data_frame())
+        return(data[row_idx, ]$to_data_frame())
     }
     if (inherits(data, "polars_data_frame")) {
-        return(as.data.frame(data[rows, ]))
+        if (!length(row_idx)) {
+            return(as.data.frame(data$slice(0L, 0L)))
+        }
+        if (length(row_idx) == 1L || all(diff(row_idx) == 1L)) {
+            return(as.data.frame(data$slice(row_idx[[1L]] - 1L, length(row_idx))))
+        }
+        return(as.data.frame(data[row_idx, ]))
     }
-    data[rows, , drop = FALSE]
+    if (is.matrix(data) && is.object(data)) {
+        page <- lapply(seq_len(ncol(data)), function(position) {
+            dataview_column(data, position)[row_idx]
+        })
+        names(page) <- colnames(data)
+        return(as.data.frame(page, optional = TRUE))
+    }
+    data[row_idx, , drop = FALSE]
 }
 
 dataview_column <- function(data, position) {
@@ -130,58 +173,12 @@ dataview_column <- function(data, position) {
         return(as.vector(data[[position]]))
     }
     if (inherits(data, "polars_data_frame")) {
-        return(as.data.frame(data[, position])[[1]])
+        return(as.data.frame(data[, position])[[1L]])
     }
     if (is.matrix(data)) {
         return(data[, position])
     }
     data[[position]]
-}
-
-dataview_text_values <- function(values) {
-    if (is.character(values) || is.factor(values)) {
-        return(as.character(values))
-    }
-    if (is.list(values)) {
-        return(vapply(values, function(value) {
-            tryCatch(
-                paste(format(value), collapse = " "),
-                error = function(e) paste0("<", paste(class(value), collapse = ", "), ">")
-            )
-        }, character(1)))
-    }
-    tryCatch(
-        as.character(values),
-        error = function(e) {
-            vapply(seq_along(values), function(index) {
-                paste(format(values[index]), collapse = " ")
-            }, character(1))
-        }
-    )
-}
-
-dataview_sort_values <- function(values) {
-    if (is.list(values) && !inherits(values, "POSIXlt")) {
-        return(dataview_text_values(values))
-    }
-    tryCatch({
-        xtfrm(values)
-        values
-    }, error = function(e) dataview_text_values(values))
-}
-
-dataview_format_page <- function(page) {
-    if (!is.data.frame(page)) {
-        return(page)
-    }
-    for (position in seq_len(ncol(page))) {
-        column <- page[[position]]
-        if (is.list(column) &&
-                !inherits(column, "POSIXlt")) {
-            page[[position]] <- dataview_text_values(column)
-        }
-    }
-    page
 }
 
 dataview_filter_condition <- function(values, condition) {
@@ -190,58 +187,79 @@ dataview_filter_condition <- function(values, condition) {
         return(rep(TRUE, length(values)))
     }
 
-    text_values <- NULL
-    blank <- function() {
-        if (is.character(values) || is.factor(values) || is.list(values)) {
-            text_values <<- dataview_text_values(values)
-            is.na(values) | text_values == ""
-        } else {
-            is.na(values)
-        }
-    }
-
     if (op == "blank") {
-        return(blank())
+        return(is.na(values) | trimws(as.character(values)) == "")
     }
     if (op == "notBlank") {
-        return(!blank())
+        return(!(is.na(values) | trimws(as.character(values)) == ""))
     }
 
-    if (inherits(values, "Date") ||
-            inherits(values, "POSIXct") ||
-            inherits(values, "POSIXlt")) {
-        values <- as.Date(values)
-        low <- as.Date(if (is.null(condition$dateFrom)) condition$filter else condition$dateFrom)
-        high <- as.Date(if (is.null(condition$dateTo)) condition$filterTo else condition$dateTo)
-    } else if (inherits(values, "integer64") &&
-                   requireNamespace("bit64", quietly = TRUE)) {
-        low <- bit64::as.integer64(as.character(condition$filter))
-        high <- bit64::as.integer64(as.character(condition$filterTo))
+    if (is.logical(values) && op == "true") {
+        result <- !is.na(values) & values
+    } else if (is.logical(values) && op == "false") {
+        result <- !is.na(values) & !values
+    } else if (inherits(values, "Date") ||
+                   inherits(values, "POSIXct") ||
+                   inherits(values, "POSIXlt")) {
+        if (inherits(values, "Date")) {
+            comparable <- as.Date(values)
+            low <- as.Date(if (is.null(condition$dateFrom)) condition$filter else condition$dateFrom)
+            high <- as.Date(if (is.null(condition$dateTo)) condition$filterTo else condition$dateTo)
+        } else {
+            comparable <- as.POSIXct(values)
+            timezone <- attr(comparable, "tzone", exact = TRUE) %||% ""
+            low <- as.POSIXct(
+                if (is.null(condition$dateFrom)) condition$filter else condition$dateFrom,
+                tz = timezone
+            )
+            high <- as.POSIXct(
+                if (is.null(condition$dateTo)) condition$filterTo else condition$dateTo,
+                tz = timezone
+            )
+        }
+        result <- switch(op,
+            equals = comparable == low,
+            notEqual = comparable != low,
+            greaterThan = comparable > low,
+            greaterThanOrEqual = comparable >= low,
+            lessThan = comparable < low,
+            lessThanOrEqual = comparable <= low,
+            inRange = comparable >= low & comparable <= high,
+            rep(TRUE, length(values))
+        )
     } else if (is.numeric(values) || is.logical(values)) {
-        values <- as.numeric(values)
-        low <- suppressWarnings(as.numeric(condition$filter))
-        high <- suppressWarnings(as.numeric(condition$filterTo))
+        if (inherits(values, "integer64")) {
+            comparable <- values
+            low <- bit64::as.integer64(condition$filter)
+            high <- bit64::as.integer64(condition$filterTo)
+        } else {
+            comparable <- as.numeric(values)
+            low <- suppressWarnings(as.numeric(condition$filter))
+            high <- suppressWarnings(as.numeric(condition$filterTo))
+        }
+        result <- switch(op,
+            equals = comparable == low,
+            notEqual = comparable != low,
+            greaterThan = comparable > low,
+            greaterThanOrEqual = comparable >= low,
+            lessThan = comparable < low,
+            lessThanOrEqual = comparable <= low,
+            inRange = comparable >= low & comparable <= high,
+            rep(TRUE, length(values))
+        )
     } else {
-        values <- tolower(dataview_text_values(values))
-        low <- tolower(as.character(condition$filter))
-        high <- NULL
+        text <- tolower(as.character(values))
+        filter_value <- tolower(as.character(condition$filter %||% ""))
+        result <- switch(op,
+            equals = text == filter_value,
+            notEqual = text != filter_value,
+            contains = grepl(filter_value, text, fixed = TRUE),
+            notContains = !grepl(filter_value, text, fixed = TRUE),
+            startsWith = startsWith(text, filter_value),
+            endsWith = endsWith(text, filter_value),
+            rep(TRUE, length(values))
+        )
     }
-
-    result <- switch(op,
-        equals             = values == low,
-        notEqual           = values != low,
-        greaterThan        = values > low,
-        greaterThanOrEqual = values >= low,
-        lessThan           = values < low,
-        lessThanOrEqual    = values <= low,
-        contains           = grepl(low, values, fixed = TRUE),
-        notContains        = !grepl(low, values, fixed = TRUE),
-        startsWith         = startsWith(values, low),
-        endsWith           = endsWith(values, low),
-        regexp             = grepl(low, values),
-        inRange            = values >= low & values <= high,
-        rep(TRUE, length(values))
-    )
     result[is.na(result)] <- FALSE
     result
 }
@@ -263,6 +281,10 @@ dataview_filter_values <- function(values, model) {
     } else {
         Reduce(`&`, matches)
     }
+}
+
+`%||%` <- function(x, y) {
+    if (is.null(x)) y else x
 }
 
 dataview_field_position <- function(field, column_count) {
@@ -297,6 +319,9 @@ dataview_query_indices <- function(state, sortModel, filterModel) {
             if (is.na(position)) {
                 next
             }
+            if (isFALSE(state$columns[[position + 2L]]$filter)) {
+                next
+            }
             values <- dataview_column(state$data, position)
             matches <- matches & dataview_filter_values(values, filterModel[[field]])
         }
@@ -308,32 +333,80 @@ dataview_query_indices <- function(state, sortModel, filterModel) {
             row_indices <- seq_len(state$total_unfiltered)
         }
 
-        sort_values <- list()
-        decreasing <- logical()
+        sort_specs <- list()
         for (sort_item in sortModel) {
             position <- dataview_field_position(sort_item$colId, state$column_count)
             if (is.na(position)) {
                 next
             }
-            values <- dataview_column(state$data, position)[row_indices]
-            sort_values[[length(sort_values) + 1L]] <- dataview_sort_values(values)
-            decreasing <- c(decreasing, identical(sort_item$sort, "desc"))
+            if (isFALSE(state$columns[[position + 2L]]$sortable)) {
+                next
+            }
+            raw_values <- dataview_column(state$data, position)[row_indices]
+            values <- if (is.factor(raw_values) && !is.ordered(raw_values)) {
+                as.character(raw_values)
+            } else {
+                raw_values
+            }
+            sort_specs[[length(sort_specs) + 1L]] <- list(
+                values = values,
+                decreasing = identical(sort_item$sort, "desc")
+            )
         }
 
-        if (length(sort_values)) {
-            # The source row index is the deterministic tie-breaker.
-            sort_values[[length(sort_values) + 1L]] <- row_indices
-            decreasing <- c(decreasing, FALSE)
-            args <- c(sort_values, list(
-                na.last = TRUE,
-                decreasing = decreasing,
-                method = "radix"
-            ))
-            row_indices <- row_indices[do.call(order, args)]
+        row_order <- seq_along(row_indices)
+        for (index in rev(seq_along(sort_specs))) {
+            spec <- sort_specs[[index]]
+            values <- spec$values[row_order]
+            order_index <- if (inherits(values, "integer64")) {
+                bit64::order(
+                    values,
+                    na.last = TRUE,
+                    decreasing = spec$decreasing
+                )
+            } else {
+                order(
+                    values,
+                    na.last = TRUE,
+                    decreasing = spec$decreasing,
+                    method = "radix"
+                )
+            }
+            row_order <- row_order[order_index]
         }
+        row_indices <- row_indices[row_order]
     }
 
     row_indices
+}
+
+dataview_rows <- function(state, row_indices) {
+    page <- dataview_slice(state$data, row_indices)
+    if (is.data.frame(page)) {
+        for (position in seq_len(ncol(page))) {
+            if (inherits(page[[position]], "POSIXct") ||
+                    inherits(page[[position]], "POSIXlt")) {
+                page[[position]] <- format(
+                    page[[position]],
+                    "%Y-%m-%dT%H:%M:%S"
+                )
+            } else if (inherits(page[[position]], "integer64")) {
+                page[[position]] <- as.character(page[[position]])
+            }
+        }
+    }
+    row_labels <- if (is.null(state$row_index)) {
+        row_indices
+    } else {
+        state$row_index[row_indices]
+    }
+    rows <- cbind(
+        data.frame(row_labels, row_indices, check.names = FALSE),
+        page
+    )
+    names(rows) <- state$fields
+    rownames(rows) <- NULL
+    rows
 }
 
 dataview_table <- local({
@@ -344,17 +417,33 @@ dataview_table <- local({
             stop("data must be a data frame, a matrix, an arrow table or a polars data frame.")
         }
 
-        column_names <- colnames(data)
+        column_names <- if (inherits(data, "ArrowTabular") ||
+                                inherits(data, "polars_data_frame")) {
+            names(data)
+        } else {
+            colnames(data)
+        }
         if (is.null(column_names)) {
-            column_names <- sprintf("V%d", seq_len(ncol(data)))
+            column_names <- sprintf("(X%d)", seq_len(ncol(data)))
         } else {
             column_names <- trimws(column_names)
         }
+        row_index <- if (is.data.frame(data) && .row_names_info(data) > 0L) {
+            rownames(data)
+        } else if (is.matrix(data)) {
+            matrix_row_names <- rownames(data)
+            if (is.null(matrix_row_names)) NULL else trimws(matrix_row_names)
+        } else {
+            NULL
+        }
         fields <- sprintf("x%d", seq_len(length(column_names) + 2L))
-        full_names <- c("(row)", "rowId", column_names)
+        full_names <- c(" ", "rowId", column_names)
         schema <- dataview_schema(data)
         schema_columns <- c(
-            list(integer(), integer()),
+            list(
+                if (is.null(row_index)) integer() else character(),
+                integer()
+            ),
             lapply(seq_len(ncol(schema)), function(position) {
                 dataview_column(schema, position)
             })
@@ -364,6 +453,7 @@ dataview_table <- local({
 
         state <- list(
             data = data,
+            row_index = row_index,
             column_count = length(column_names),
             columns = .mapply(
                 get_column_def,
@@ -431,7 +521,6 @@ dataview_table <- local({
 
         if (first > total_rows || last < 1L || first > last) {
             source_rows <- integer()
-            display_rows <- integer()
         } else {
             display_rows <- seq.int(first, last)
             source_rows <- if (is.null(state$query_indices)) {
@@ -441,12 +530,7 @@ dataview_table <- local({
             }
         }
 
-        page <- dataview_format_page(dataview_slice(state$data, source_rows))
-        rows <- cbind(
-            data.frame(display_rows, source_rows, check.names = FALSE),
-            page
-        )
-        names(rows) <- state$fields
+        rows <- dataview_rows(state, source_rows)
 
         list(
             rows = rows,
@@ -556,7 +640,7 @@ if (use_webserver) {
                 }
                 obj <- eval(source$expression, envir = source$environment)
 
-                if (is.environment(obj)) {
+                if (is.environment(obj) && !dataview_is_table(obj)) {
                     all_names <- ls(obj)
                     is_active <- vapply(all_names, bindingIsActive, logical(1), USE.NAMES = TRUE, obj)
                     is_promise <- rlang::env_binding_are_lazy(obj, all_names[!is_active])
@@ -699,12 +783,7 @@ if (use_webserver) {
                         body = jsonlite::toJSON(
                             response,
                             auto_unbox = TRUE,
-                            force = TRUE,
-                            na = if (identical(request$type, "dataview_fetch_rows")) {
-                                "string"
-                            } else {
-                                "null"
-                            }
+                            force = TRUE
                         )
                     )
                 }
@@ -1160,7 +1239,7 @@ if (show_view) {
             logger("Created new dataview UUID for title:", title, "UUID:", dataview_uuid)
         }
 
-        if (is.environment(x)) {
+        if (is.environment(x) && !dataview_is_table(x)) {
             all_names <- ls(x)
             is_active <- vapply(all_names, bindingIsActive, logical(1), USE.NAMES = TRUE, x)
             is_promise <- rlang::env_binding_are_lazy(x, all_names[!is_active])

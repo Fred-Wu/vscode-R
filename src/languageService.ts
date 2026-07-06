@@ -2,20 +2,28 @@ import * as os from 'os';
 import { dirname } from 'path';
 import * as net from 'net';
 import { URL } from 'url';
-import { LanguageClient, LanguageClientOptions, StreamInfo, DocumentFilter, ErrorAction, CloseAction, RevealOutputChannelOn } from 'vscode-languageclient/node';
+import { LanguageClient, LanguageClientOptions, StreamInfo, DocumentFilter, ErrorAction, CloseAction, RevealOutputChannelOn, Middleware } from 'vscode-languageclient/node';
 import { Disposable, workspace, Uri, TextDocument, WorkspaceConfiguration, OutputChannel, window, WorkspaceFolder } from 'vscode';
 import { DisposableProcess, getRLibPaths, getRpath, promptToInstallRPackage, spawn, substituteVariables } from './util';
 import { extensionContext } from './extension';
 import { CommonOptions } from 'child_process';
 
 export class LanguageService implements Disposable {
+    private static readonly singleClientKey = 'global';
+    private static readonly idleStopDelayMs = 30_000;
     private client: LanguageClient | undefined;
     private readonly clients: Map<string, LanguageClient> = new Map();
     private readonly initSet: Set<string> = new Set();
     // Track open documents per server key for proper cleanup
     private readonly openDocuments: Map<string, Set<string>> = new Map();
+    private readonly stoppingClients: Map<string, Promise<void>> = new Map();
+    private readonly restartAfterStop: Map<string, () => void> = new Map();
+    private readonly idleStopTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+    private readonly quartoVirtualDocumentServerKeys: Map<string, string> = new Map();
+    private readonly disposables: Disposable[] = [];
     private readonly config: WorkspaceConfiguration;
     private readonly outputChannel: OutputChannel;
+    private disposed = false;
 
     constructor() {
         this.outputChannel = window.createOutputChannel('R Language Server');
@@ -25,10 +33,12 @@ export class LanguageService implements Disposable {
     }
 
     dispose(): Thenable<void> {
+        this.disposed = true;
         return this.stopLanguageService();
     }
 
-    private spawnServer(client: LanguageClient, rPath: string, args: readonly string[], options: CommonOptions & { cwd: string }): DisposableProcess {
+    private spawnServer(client: LanguageClient, rPath: string, args: readonly string[], options: CommonOptions & { cwd: string },
+        onExit?: (client: LanguageClient) => void): DisposableProcess {
         const childProcess = spawn(rPath, args, options);
         const pid = childProcess.pid || -1;
         client.outputChannel.appendLine(`R Language Server (${pid}) started`);
@@ -50,13 +60,14 @@ export class LanguageService implements Disposable {
                     client.outputChannel.show();
                 }
             }
-            void client.stop();
+            onExit?.(client);
         });
         return childProcess;
     }
 
     private async createClient(config: WorkspaceConfiguration, selector: DocumentFilter[],
-        cwd: string, workspaceFolder: WorkspaceFolder | undefined, outputChannel: OutputChannel): Promise<LanguageClient> {
+        cwd: string, workspaceFolder: WorkspaceFolder | undefined, outputChannel: OutputChannel,
+        serverKey: string, onExit?: (client: LanguageClient) => void): Promise<LanguageClient> {
 
         let client: LanguageClient;
 
@@ -116,11 +127,26 @@ export class LanguageService implements Disposable {
             server.listen(0, '127.0.0.1', () => {
                 const port = (server.address() as net.AddressInfo).port;
                 env.VSCR_LSP_PORT = String(port);
-                return this.spawnServer(client, rPath, args, options);
+                return this.spawnServer(client, rPath, args, options, onExit);
             });
         });
 
         // Options to control the language client
+        const middleware: Middleware = {
+            sendRequest: async (type, param, token, next) => {
+                if (!this.shouldRouteToClient(serverKey, param)) {
+                    return undefined as never;
+                }
+                return next(type, param, token);
+            },
+            sendNotification: async (type, next, params) => {
+                if (!this.shouldRouteToClient(serverKey, params)) {
+                    return;
+                }
+                return next(type, params);
+            }
+        };
+
         const clientOptions: LanguageClientOptions = {
             // Register the server for selected R documents
             documentSelector: selector,
@@ -137,6 +163,7 @@ export class LanguageService implements Disposable {
                 configurationSection: 'r.lsp',
                 fileEvents: workspace.createFileSystemWatcher('**/*.{R,r}'),
             },
+            middleware,
             revealOutputChannelOn: RevealOutputChannelOn.Never,
             errorHandler: {
                 error: () =>    {
@@ -145,6 +172,7 @@ export class LanguageService implements Disposable {
                     };
                 },
                 closed: () => {
+                    onExit?.(client);
                     return {
                         action: CloseAction.DoNotRestart,
                         handled: true
@@ -160,34 +188,98 @@ export class LanguageService implements Disposable {
             client = new LanguageClient('r', 'R Language Server', tcpServerOptions, clientOptions);
         }
 
-        extensionContext.subscriptions.push(client);
-        await client.start();
-        return client;
+        try {
+            await client.start();
+            return client;
+        } catch (error) {
+            try {
+                await client.dispose();
+            } catch {
+                // A failed start may leave no active connection to dispose.
+            }
+            throw error;
+        }
     }
 
     private isClientInitializing(name: string): boolean {
         return this.initSet.has(name);
     }
-    
-    private isQuartoChunkTempUri(uriString: string): boolean {
-        try {
-            const uri = Uri.parse(uriString);
-            if (uri.scheme !== 'file') {
-                return false;
-            }
-            const fsPath = uri.fsPath;
-            // Quarto temp docs look like: /var/.../tmp-.../.vdoc.<uuid>.r
-            return fsPath.includes('.vdoc.') && fsPath.toLowerCase().endsWith('.r');
-        } catch {
-            return false;
-        }
+
+    private isQuartoDocument(document: TextDocument): boolean {
+        return document.languageId === 'quarto' ||
+            document.uri.fsPath.toLowerCase().endsWith('.qmd');
     }
 
-    private isUntitledQuartoDoc(document: TextDocument): boolean {
-        return document.uri.scheme === 'untitled' &&
-            (document.languageId === 'quarto' ||
-                document.languageId === 'r' ||
-                document.languageId === 'rmd');
+    private isQuartoVirtualDocument(document: TextDocument): boolean {
+        const fsPath = document.uri.fsPath.toLowerCase();
+        return document.uri.scheme === 'file' &&
+            document.languageId === 'r' &&
+            fsPath.includes('.vdoc.') &&
+            fsPath.endsWith('.r');
+    }
+
+    private isTemporaryRSource(document: TextDocument): boolean {
+        if (document.uri.scheme !== 'file') {
+            return false;
+        }
+        const fsPath = document.uri.fsPath.toLowerCase();
+        return fsPath.includes('rtmp') &&
+            fsPath.endsWith('.r') &&
+            !fsPath.includes('.vdoc.');
+    }
+
+    private shouldRouteToClient(serverKey: string, params: unknown): boolean {
+        if (!params || typeof params !== 'object') {
+            return true;
+        }
+        const textDocument = (params as { textDocument?: { uri?: unknown } }).textDocument;
+        if (typeof textDocument?.uri !== 'string') {
+            return true;
+        }
+        const documentKey = Uri.parse(textDocument.uri).toString();
+        const mappedServerKey = this.quartoVirtualDocumentServerKeys.get(documentKey);
+        return !mappedServerKey || mappedServerKey === serverKey;
+    }
+
+    private getParentQuartoDocument(document: TextDocument): TextDocument | undefined {
+        const sourceFolder = workspace.getWorkspaceFolder(document.uri);
+        const matchesWorkspace = (candidate: TextDocument): boolean =>
+            this.isQuartoDocument(candidate) &&
+            (!sourceFolder ||
+                workspace.getWorkspaceFolder(candidate.uri)?.uri.toString(true) === sourceFolder.uri.toString(true));
+
+        const activeDocument = window.activeTextEditor?.document;
+        if (activeDocument && matchesWorkspace(activeDocument)) {
+            return activeDocument;
+        }
+
+        const visibleDocuments = window.visibleTextEditors
+            .map(editor => editor.document)
+            .filter(matchesWorkspace);
+        if (visibleDocuments.length === 1) {
+            return visibleDocuments[0];
+        }
+        const visibleServerKeys = new Set(
+            visibleDocuments
+                .map(candidate => this.getServerKey(candidate))
+                .filter((key): key is string => key !== null)
+        );
+        if (visibleDocuments.length > 1 && visibleServerKeys.size === 1) {
+            return visibleDocuments[visibleDocuments.length - 1];
+        }
+
+        const openDocuments = workspace.textDocuments.filter(matchesWorkspace);
+        if (openDocuments.length === 1) {
+            return openDocuments[0];
+        }
+        const openServerKeys = new Set(
+            openDocuments
+                .map(candidate => this.getServerKey(candidate))
+                .filter((key): key is string => key !== null)
+        );
+        return openDocuments.length > 1 && openServerKeys.size === 1
+            ? openDocuments[openDocuments.length - 1]
+            : undefined;
     }
 
     private getServerKey(document: TextDocument): string | null {
@@ -233,10 +325,165 @@ export class LanguageService implements Disposable {
         }
         return false; // Still has open documents
     }
-    
+
+    private hasOpenTrackedDocuments(serverKey: string): boolean {
+        const documents = this.openDocuments.get(serverKey);
+        if (!documents) {
+            return false;
+        }
+
+        for (const uri of Array.from(documents)) {
+            const isOpen = workspace.textDocuments.some(document =>
+                document.uri.toString(true) === uri
+            );
+            if (isOpen) {
+                return true;
+            }
+            documents.delete(uri);
+        }
+
+        this.openDocuments.delete(serverKey);
+        return false;
+    }
+
+    private hasOpenSingleServerDocuments(): boolean {
+        const hasOpenRDocument = workspace.textDocuments.some(document =>
+            (document.uri.scheme === 'file' ||
+                document.uri.scheme === 'untitled' ||
+                document.uri.scheme === 'vscode-notebook-cell') &&
+            (document.languageId === 'r' || document.languageId === 'rmd') &&
+            !this.isTemporaryRSource(document) &&
+            !this.isQuartoVirtualDocument(document)
+        );
+        return hasOpenRDocument ||
+            this.hasOpenTrackedDocuments(LanguageService.singleClientKey);
+    }
+
+    private getClient(serverKey: string): LanguageClient | undefined {
+        return serverKey === LanguageService.singleClientKey
+            ? this.client
+            : this.clients.get(serverKey);
+    }
+
+    private deleteClient(serverKey: string): void {
+        if (serverKey === LanguageService.singleClientKey) {
+            this.client = undefined;
+        } else {
+            this.clients.delete(serverKey);
+        }
+    }
+
+    private cancelIdleStop(serverKey: string): void {
+        const timer = this.idleStopTimers.get(serverKey);
+        if (timer) {
+            clearTimeout(timer);
+            this.idleStopTimers.delete(serverKey);
+        }
+    }
+
+    private scheduleIdleStop(serverKey: string, shouldStop: () => boolean): void {
+        if (this.disposed || this.idleStopTimers.has(serverKey)) {
+            return;
+        }
+        const timer = setTimeout(() => {
+            this.idleStopTimers.delete(serverKey);
+            if (shouldStop()) {
+                void this.stopClient(serverKey);
+            }
+        }, LanguageService.idleStopDelayMs);
+        this.idleStopTimers.set(serverKey, timer);
+    }
+
+    private clearIdleStops(): void {
+        for (const timer of this.idleStopTimers.values()) {
+            clearTimeout(timer);
+        }
+        this.idleStopTimers.clear();
+    }
+
     private stopAndDisposeClient(client: LanguageClient): Thenable<void> {
         client.clientOptions.errorHandler = undefined;
+        if (!client.needsStop()) {
+            return client.dispose();
+        }
         return client.stop().then(() => client.dispose());
+    }
+
+    private queueRestartAfterStop(serverKey: string, restart: () => void): boolean {
+        if (!this.stoppingClients.has(serverKey)) {
+            return false;
+        }
+        this.restartAfterStop.set(serverKey, restart);
+        return true;
+    }
+
+    private stopClient(serverKey: string): Promise<void> | undefined {
+        this.cancelIdleStop(serverKey);
+        const existingStop = this.stoppingClients.get(serverKey);
+        if (existingStop) {
+            return existingStop;
+        }
+
+        const client = this.getClient(serverKey);
+        this.openDocuments.delete(serverKey);
+        if (!client) {
+            return undefined;
+        }
+
+        this.deleteClient(serverKey);
+        this.initSet.delete(serverKey);
+        const stopPromise = Promise.resolve(this.stopAndDisposeClient(client))
+            .catch(error => {
+                this.outputChannel.appendLine(`Failed to stop R language server: ${String(error)}`);
+            })
+            .finally(() => {
+                this.stoppingClients.delete(serverKey);
+                const restart = this.restartAfterStop.get(serverKey);
+                this.restartAfterStop.delete(serverKey);
+                if (!this.disposed) {
+                    restart?.();
+                }
+            });
+        this.stoppingClients.set(serverKey, stopPromise);
+        return stopPromise;
+    }
+
+    private handleClientExit(serverKey: string, client: LanguageClient): void {
+        if (this.getClient(serverKey) !== client) {
+            return;
+        }
+        this.deleteClient(serverKey);
+        this.initSet.delete(serverKey);
+        this.cancelIdleStop(serverKey);
+        void client.dispose();
+    }
+
+    private forgetStoppedClient(serverKey: string): void {
+        const client = this.getClient(serverKey);
+        if (client && !client.needsStop()) {
+            this.deleteClient(serverKey);
+            this.initSet.delete(serverKey);
+            void client.dispose();
+        }
+    }
+
+    private withQuartoVirtualSelector(selector: DocumentFilter[]): DocumentFilter[] {
+        return selector.concat({
+            scheme: 'file',
+            language: 'r',
+            pattern: '**/.vdoc.*.r'
+        });
+    }
+
+    private async registerMultiClient(serverKey: string, client: LanguageClient): Promise<void> {
+        if (this.disposed) {
+            await this.stopAndDisposeClient(client);
+            return;
+        }
+        this.clients.set(serverKey, client);
+        if (!this.hasOpenTrackedDocuments(serverKey)) {
+            this.scheduleIdleStop(serverKey, () => !this.hasOpenTrackedDocuments(serverKey));
+        }
     }
 
     private startMultiLanguageService(self: LanguageService): void {
@@ -249,27 +496,35 @@ export class LanguageService implements Disposable {
                 return;
             }
             
-            if (document.uri.scheme === 'file') {
-                const path = document.uri.fsPath.toLowerCase();
-                // Detect R's temporary source files in Rtmp* folders
-                const isRTempFile = path.includes('rtmp') && 
-                                  (path.endsWith('.r') || path.endsWith('.R')) &&
-                                  !path.includes('.vdoc.');
-
-                if (isRTempFile) {
-                    return; 
-                }
+            if (self.isTemporaryRSource(document)) {
+                return;
             }
 
-            const serverKey = self.getServerKey(document);
+            const quartoParent = self.isQuartoVirtualDocument(document)
+                ? self.getParentQuartoDocument(document)
+                : undefined;
+            const serverDocument = quartoParent ?? document;
+            const serverKey = self.getServerKey(serverDocument);
             if (!serverKey) {
                 return;
             }
 
-            // Track this document
-            self.trackDocument(serverKey, document.uri.toString(true));
+            if (self.isQuartoVirtualDocument(document)) {
+                self.quartoVirtualDocumentServerKeys.set(document.uri.toString(), serverKey);
+            }
+            self.trackDocument(serverKey, serverDocument.uri.toString(true));
+            self.cancelIdleStop(serverKey);
+
+            if (self.queueRestartAfterStop(serverKey, () => {
+                if (self.hasOpenTrackedDocuments(serverKey)) {
+                    void didOpenTextDocument(document);
+                }
+            })) {
+                return;
+            }
 
             // Check if server already exists or is being initialized
+            self.forgetStoppedClient(serverKey);
             if (self.clients.has(serverKey) || self.isClientInitializing(serverKey)) {
                 return;
             }
@@ -278,17 +533,20 @@ export class LanguageService implements Disposable {
             self.initSet.add(serverKey);
 
             try {
-                const folder = workspace.getWorkspaceFolder(document.uri);
+                const folder = workspace.getWorkspaceFolder(serverDocument.uri);
 
                 // Each notebook uses a server started from parent folder
-                if (document.uri.scheme === 'vscode-notebook-cell') {
+                if (serverDocument.uri.scheme === 'vscode-notebook-cell') {
                     console.log(`Starting language server for notebook: ${document.uri.toString(true)}`);
-                    const documentSelector: DocumentFilter[] = [
-                        { scheme: 'vscode-notebook-cell', language: 'r', pattern: `${document.uri.fsPath}` },
-                    ];
-                    const client = await self.createClient(self.config, documentSelector,
-                        dirname(document.uri.fsPath), folder, self.outputChannel);
-                    self.clients.set(serverKey, client);
+                    const documentSelector = self.withQuartoVirtualSelector([
+                        { scheme: 'vscode-notebook-cell', language: 'r', pattern: `${serverDocument.uri.fsPath}` },
+                    ]);
+                    const client = await self.createClient(
+                        self.config, documentSelector, dirname(serverDocument.uri.fsPath),
+                        folder, self.outputChannel, serverKey,
+                        exitedClient => self.handleClientExit(serverKey, exitedClient)
+                    );
+                    await self.registerMultiClient(serverKey, client);
                     return;
                 }
 
@@ -296,38 +554,47 @@ export class LanguageService implements Disposable {
                     // Each workspace uses a server started from the workspace folder
                     console.log(`Starting language server for workspace: ${folder.name} (${folder.uri.toString(true)})`);
                     const pattern = `${folder.uri.fsPath}/**/*`;
-                    const documentSelector: DocumentFilter[] = [
+                    const documentSelector = self.withQuartoVirtualSelector([
                         { scheme: 'file', language: 'r', pattern: pattern },
                         { scheme: 'file', language: 'rmd', pattern: pattern },
-                    ];
-                    const client = await self.createClient(self.config, documentSelector, 
-                        folder.uri.fsPath, folder, self.outputChannel);
-                    self.clients.set(serverKey, client);
+                    ]);
+                    const client = await self.createClient(
+                        self.config, documentSelector, folder.uri.fsPath,
+                        folder, self.outputChannel, serverKey,
+                        exitedClient => self.handleClientExit(serverKey, exitedClient)
+                    );
+                    await self.registerMultiClient(serverKey, client);
 
                 } else {
                     // All untitled documents share a server started from home folder
-                    if (document.uri.scheme === 'untitled') {
+                    if (serverDocument.uri.scheme === 'untitled') {
                         console.log(`Starting language server for untitled documents`);
-                        const documentSelector: DocumentFilter[] = [
+                        const documentSelector = self.withQuartoVirtualSelector([
                             { scheme: 'untitled', language: 'r' },
                             { scheme: 'untitled', language: 'rmd' },
-                        ];
-                        const client = await self.createClient(self.config, documentSelector, 
-                            os.homedir(), undefined, self.outputChannel);
-                        self.clients.set(serverKey, client);
+                        ]);
+                        const client = await self.createClient(
+                            self.config, documentSelector, os.homedir(),
+                            undefined, self.outputChannel, serverKey,
+                            exitedClient => self.handleClientExit(serverKey, exitedClient)
+                        );
+                        await self.registerMultiClient(serverKey, client);
                         return;
                     }
 
                     // Each file outside workspace uses a server started from parent folder
-                    if (document.uri.scheme === 'file') {
+                    if (serverDocument.uri.scheme === 'file') {
                         console.log(`Starting language server for standalone file: ${document.uri.toString(true)}`);
-                        const dir = dirname(document.uri.fsPath);
-                        const documentSelector: DocumentFilter[] = [
+                        const dir = dirname(serverDocument.uri.fsPath);
+                        const documentSelector = self.withQuartoVirtualSelector([
                             { scheme: 'file', pattern: `${dir}/**/*.{R,r,Rmd,rmd}` },
-                        ];
-                        const client = await self.createClient(self.config, documentSelector,
-                            dir, undefined, self.outputChannel);
-                        self.clients.set(serverKey, client);
+                        ]);
+                        const client = await self.createClient(
+                            self.config, documentSelector, dir,
+                            undefined, self.outputChannel, serverKey,
+                            exitedClient => self.handleClientExit(serverKey, exitedClient)
+                        );
+                        await self.registerMultiClient(serverKey, client);
                         return;
                     }
                 }
@@ -339,70 +606,56 @@ export class LanguageService implements Disposable {
 
         function didCloseTextDocument(document: TextDocument): void {
             const isRDoc = document.languageId === 'r' || document.languageId === 'rmd';
-            const isQuartoDoc = document.uri.fsPath.toLowerCase().endsWith('.qmd');
 
-            // Normal R / Rmd behaviour (unchanged)
             if (isRDoc) {
                 const serverKey = self.getServerKey(document);
                 if (!serverKey) {
                     return;
                 }
 
-                const shouldStop = self.untrackDocument(serverKey, document.uri.toString(true));
-                if (shouldStop) {
-                    const client = self.clients.get(serverKey);
-                    if (client) {
-                        console.log(`Stopping language server for: ${serverKey}`);
-                        self.clients.delete(serverKey);
-                        self.initSet.delete(serverKey);
-                        void self.stopAndDisposeClient(client);
-                    }
+                self.untrackDocument(serverKey, document.uri.toString(true));
+                if (!self.hasOpenTrackedDocuments(serverKey)) {
+                    self.scheduleIdleStop(
+                        serverKey,
+                        () => !self.hasOpenTrackedDocuments(serverKey)
+                    );
                 }
                 return;
             }
 
-            // Extra: when a Quarto document (.qmd) closes, immediately
-            // stop any clients that only serve Quarto temp chunk docs
-            if (isQuartoDoc || self.isUntitledQuartoDoc(document)) {
-                for (const [serverKey, client] of self.clients.entries()) {
-                    const docs = self.openDocuments.get(serverKey);
-                    if (!docs || docs.size === 0) {
-                        continue;
-                    }
-
-                    const allQuartoTemp = Array.from(docs).every(uriStr =>
-                        self.isQuartoChunkTempUri(uriStr)
-                    );
-
-                    if (allQuartoTemp) {
-                        console.log(`Stopping language server for Quarto chunks: ${serverKey} (closed ${document.uri.toString(true)})`);
-                        self.openDocuments.delete(serverKey);
-                        self.clients.delete(serverKey);
-                        self.initSet.delete(serverKey);
-                        void self.stopAndDisposeClient(client);
+            if (self.isQuartoDocument(document)) {
+                const serverKey = self.getServerKey(document);
+                if (serverKey) {
+                    self.untrackDocument(serverKey, document.uri.toString(true));
+                    if (!self.hasOpenTrackedDocuments(serverKey)) {
+                        self.scheduleIdleStop(
+                            serverKey,
+                            () => !self.hasOpenTrackedDocuments(serverKey)
+                        );
                     }
                 }
             }
         }
 
-
-        workspace.onDidOpenTextDocument(didOpenTextDocument);
-        workspace.onDidCloseTextDocument(didCloseTextDocument);
-        workspace.textDocuments.forEach((doc) => void didOpenTextDocument(doc));
-        
-        workspace.onDidChangeWorkspaceFolders((event) => {
-            for (const folder of event.removed) {
-                const serverKey = folder.uri.toString(true);
-                const client = self.clients.get(serverKey);
-                if (client) {
-                    console.log(`Stopping language server for removed workspace: ${folder.name}`);
-                    self.clients.delete(serverKey);
-                    self.initSet.delete(serverKey);
-                    self.openDocuments.delete(serverKey);
-                    void self.stopAndDisposeClient(client);
-                }
+        const openDisposable = workspace.onDidOpenTextDocument(didOpenTextDocument);
+        const closeDisposable = workspace.onDidCloseTextDocument(document => {
+            didCloseTextDocument(document);
+            if (self.isQuartoVirtualDocument(document)) {
+                setTimeout(() => {
+                    self.quartoVirtualDocumentServerKeys.delete(document.uri.toString());
+                }, 0);
             }
         });
+        workspace.textDocuments.forEach((doc) => void didOpenTextDocument(doc));
+        
+        const workspaceDisposable = workspace.onDidChangeWorkspaceFolders((event) => {
+            for (const folder of event.removed) {
+                const serverKey = folder.uri.toString(true);
+                console.log(`Stopping language server for removed workspace: ${folder.name}`);
+                void self.stopClient(serverKey);
+            }
+        });
+        self.disposables.push(openDisposable, closeDisposable, workspaceDisposable);
     }
 
     private async startLanguageService(self: LanguageService): Promise<void> {
@@ -410,68 +663,147 @@ export class LanguageService implements Disposable {
             return this.startMultiLanguageService(self);
         } else {
             // Single server mode - only start when R files are opened
-            const startSingleServer = async () => {
-                if (self.client) {
-                    return; // Already started
+            const startSingleServer = async (document?: TextDocument) => {
+                const serverKey = LanguageService.singleClientKey;
+                const isQuartoVirtualDocument = document &&
+                    self.isQuartoVirtualDocument(document);
+                if (isQuartoVirtualDocument) {
+                    const parent = self.getParentQuartoDocument(document);
+                    if (parent) {
+                        self.trackDocument(serverKey, parent.uri.toString(true));
+                    }
                 }
 
+                if (self.disposed ||
+                    (!isQuartoVirtualDocument && !self.hasOpenSingleServerDocuments())) {
+                    return;
+                }
+
+                self.cancelIdleStop(serverKey);
+                if (self.queueRestartAfterStop(serverKey, () => {
+                    if (self.hasOpenSingleServerDocuments()) {
+                        void startSingleServer();
+                    }
+                })) {
+                    return;
+                }
+
+                self.forgetStoppedClient(serverKey);
+                if (self.client || self.isClientInitializing(serverKey)) {
+                    return;
+                }
+
+                self.initSet.add(serverKey);
                 const documentSelector: DocumentFilter[] = [
-                    { language: 'r' },
-                    { language: 'rmd' },
+                    { scheme: 'file', language: 'r' },
+                    { scheme: 'file', language: 'rmd' },
+                    { scheme: 'untitled', language: 'r' },
+                    { scheme: 'untitled', language: 'rmd' },
+                    { scheme: 'vscode-notebook-cell', language: 'r' },
                 ];
 
                 const workspaceFolder = workspace.workspaceFolders?.[0];
                 const cwd = workspaceFolder ? workspaceFolder.uri.fsPath : os.homedir();
                 console.log(`Starting single language server in: ${cwd}`);
-                self.client = await self.createClient(self.config, documentSelector, cwd, workspaceFolder, self.outputChannel);
+                try {
+                    const client = await self.createClient(
+                        self.config, documentSelector, cwd,
+                        workspaceFolder, self.outputChannel, serverKey,
+                        exitedClient => self.handleClientExit(serverKey, exitedClient)
+                    );
+                    if (self.disposed) {
+                        await self.stopAndDisposeClient(client);
+                        return;
+                    }
+                    self.client = client;
+                    if (!self.hasOpenSingleServerDocuments()) {
+                        self.scheduleIdleStop(
+                            serverKey,
+                            () => !self.hasOpenSingleServerDocuments()
+                        );
+                    }
+                } finally {
+                    self.initSet.delete(serverKey);
+                }
             };
 
             const stopSingleServer = () => {
-                // Check if any R files are still open
-                const hasRFiles = workspace.textDocuments.some(doc => 
-                    (doc.languageId === 'r' || doc.languageId === 'rmd')
-                );
-
-                if (!hasRFiles && self.client) {
-                    console.log('Stopping single language server - no R files open');
-                    const client = self.client;
-                    self.client = undefined;
-                    void self.stopAndDisposeClient(client);
+                if (!self.hasOpenSingleServerDocuments()) {
+                    self.scheduleIdleStop(
+                        LanguageService.singleClientKey,
+                        () => !self.hasOpenSingleServerDocuments()
+                    );
                 }
             };
 
             // Set up listeners for single server mode
-            workspace.onDidOpenTextDocument(async (document) => {
+            const openDisposable = workspace.onDidOpenTextDocument(async (document) => {
                 if (document.languageId === 'r' || document.languageId === 'rmd') {
-                    await startSingleServer();
+                    await startSingleServer(document);
                 }
             });
 
-            workspace.onDidCloseTextDocument(() => {
+            const closeDisposable = workspace.onDidCloseTextDocument(document => {
+                if (self.isQuartoDocument(document)) {
+                    self.untrackDocument(
+                        LanguageService.singleClientKey,
+                        document.uri.toString(true)
+                    );
+                }
                 stopSingleServer();
             });
+            self.disposables.push(openDisposable, closeDisposable);
 
-            // Start server if R files are already open
-            const hasRFiles = workspace.textDocuments.some(doc => 
-                (doc.languageId === 'r' || doc.languageId === 'rmd')
+            for (const document of workspace.textDocuments) {
+                if (self.isQuartoVirtualDocument(document)) {
+                    const parent = self.getParentQuartoDocument(document);
+                    if (parent) {
+                        self.trackDocument(
+                            LanguageService.singleClientKey,
+                            parent.uri.toString(true)
+                        );
+                    }
+                }
+            }
+
+            const openRDocument = workspace.textDocuments.find(document =>
+                (document.languageId === 'r' || document.languageId === 'rmd') &&
+                !self.isTemporaryRSource(document)
             );
-            if (hasRFiles) {
-                await startSingleServer();
+            if (openRDocument) {
+                await startSingleServer(openRDocument);
             }
         }
     }
 
     private stopLanguageService(): Thenable<void> {
-        const promises: Thenable<void>[] = [];
+        this.clearIdleStops();
+        this.restartAfterStop.clear();
+        for (const disposable of this.disposables.splice(0)) {
+            disposable.dispose();
+        }
+
+        const promises: Promise<void>[] = [];
         if (this.client) {
-            promises.push(this.stopAndDisposeClient(this.client));
+            const stopping = this.stopClient(LanguageService.singleClientKey);
+            if (stopping) {
+                promises.push(stopping);
+            }
         }
-        for (const client of this.clients.values()) {
-            promises.push(this.stopAndDisposeClient(client));
+        for (const serverKey of Array.from(this.clients.keys())) {
+            const stopping = this.stopClient(serverKey);
+            if (stopping) {
+                promises.push(stopping);
+            }
         }
-        this.clients.clear();
+        for (const stopping of this.stoppingClients.values()) {
+            if (!promises.includes(stopping)) {
+                promises.push(stopping);
+            }
+        }
         this.initSet.clear();
         this.openDocuments.clear();
+        this.quartoVirtualDocumentServerKeys.clear();
         return Promise.all(promises).then(() => undefined);
     }
 }
