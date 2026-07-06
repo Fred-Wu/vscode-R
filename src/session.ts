@@ -730,35 +730,6 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
         position: relative;
     }
 
-    /* NEW: Loading overlay — shows instantly */
-    #loadingOverlay {
-        position: absolute;
-        top: 0; left: 0; width: 100%; height: 100%;
-        background: var(--vscode-editor-background);
-        color: var(--vscode-editor-foreground);
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        z-index: 1000;
-        transition: opacity 0.4s ease-out;
-        font-family: var(--vscode-editor-font-family);
-    }
-    #loadingOverlay.hidden {
-        opacity: 0;
-        pointer-events: none;
-    }
-    .spinner {
-        font-size: 48px;
-        opacity: 0.15;
-        margin-bottom: 16px;
-        animation: spin 1.5s linear infinite;
-    }
-    @keyframes spin {
-        from { transform: rotate(0deg); }
-        to { transform: rotate(360deg); }
-    }
-    /* Your original styles (unchanged) */
     [class*="vscode"] div.ag-root-wrapper {
         background-color: var(--vscode-editor-background);
     }
@@ -769,8 +740,7 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
     [class*="vscode"] div.ag-header-cell[aria-sort="descending"] {
         color: var(--vscode-textLink-activeForeground);
     }
-    [class*="vscode"] div.ag-header-cell.ag-header-cell-filtered, 
-    [class*="vscode"] div.ag-header-cell[aria-filtered="true"] {
+    [class*="vscode"] div.ag-header-cell.ag-header-cell-filtered {
       color: var(--vscode-textLink-activeForeground);
     }
     [class*="vscode"] div.ag-row {
@@ -815,44 +785,268 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
     [class*="vscode"] input[class^=ag-] {
         border-color: var(--vscode-notificationCenter-border) !important;
     }
+
+    #gridContainer {
+        position: relative;
+        height: 100%;
+    }
+
+    #fetchStatus {
+        position: absolute;
+        top: var(--fetch-status-top, 52px);
+        right: 8px;
+        z-index: 20;
+        display: none;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        border: 1px solid var(--vscode-panel-border);
+        border-radius: 4px;
+        background-color: var(--vscode-editorWidget-background);
+        color: var(--vscode-editorWidget-foreground);
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+        font-size: 12px;
+        max-width: min(68vw, 560px);
+    }
+
+    #fetchStatus.visible {
+        display: flex;
+    }
+
+    #fetchStatus[data-state="warning"] {
+        border-color: var(--vscode-inputValidation-warningBorder);
+    }
+
+    #fetchStatus[data-state="error"] {
+        border-color: var(--vscode-inputValidation-errorBorder);
+    }
+
+    #fetchStatusText {
+        word-break: break-word;
+    }
+
+    #fetchRetryBtn {
+        display: none;
+        border: 0;
+        padding: 3px 8px;
+        background-color: var(--vscode-button-background);
+        color: var(--vscode-button-foreground);
+        cursor: pointer;
+        white-space: nowrap;
+    }
+
+    #fetchStatus.show-retry #fetchRetryBtn {
+        display: inline-block;
+    }
+
+    #scrollPosition {
+        position: absolute;
+        top: 52px;
+        right: 24px;
+        z-index: 21;
+        display: none;
+        padding: 4px 8px;
+        border: 1px solid var(--vscode-panel-border);
+        border-radius: 4px;
+        background-color: var(--vscode-editorWidget-background);
+        color: var(--vscode-editorWidget-foreground);
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+        font-size: 12px;
+        pointer-events: none;
+        white-space: nowrap;
+    }
+
+    #scrollPosition.visible {
+        display: block;
+    }
     </style>
     <script src="${String(webview.asWebviewUri(Uri.file(path.join(resDir, 'ag-grid-community.min.noStyle.js'))))}"></script>
-    <link href="${String(webview.asWebviewUri(Uri.file(path.join(resDir, 'ag-grid.min.css'))))}" rel="stylesheet">
-    <link href="${String(webview.asWebviewUri(Uri.file(path.join(resDir, 'ag-theme-balham.min.css'))))}" rel="stylesheet">
     <script>
 
     const vscode = acquireVsCodeApi();
-    let hasReceivedFirstRows = false;
+    let gridApi;
+    let filteredRows = 0;
+    let totalRows = 0;
+    let isFiltered = false;
+    const bigintFields = [];
+    let activeFetches = 0;
+    let longFetchTimer;
+    let verticalScrollbar;
+    let scrollbarPositionAttached = false;
+    let scrollbarPressed = false;
+    const LONG_FETCH_DELAY_MS = 2000;
+    const rowNumberFormatter = new Intl.NumberFormat();
 
     const dateFilterParams = {
-        browserDatePicker: true,
-        comparator: function (filterLocalDateAtMidnight, cellValue) {
-            var dateAsString = cellValue;
-            if (dateAsString == null) return -1;
-            var dateParts = dateAsString.split('-');
-            var cellDate = new Date(Number(dateParts[0]), Number(dateParts[1]) - 1, Number(dateParts[2].substr(0, 2)));
-            if (filterLocalDateAtMidnight.getTime() == cellDate.getTime()) {
-                return 0;
-            }
-            if (cellDate < filterLocalDateAtMidnight) {
-                return -1;
-            }
-            if (cellDate > filterLocalDateAtMidnight) {
-                return 1;
-            }
+        browserDatePicker: true
+    };
+
+    function getAgTheme() {
+        if (document.body.classList.contains('vscode-light')) {
+            return window.agGrid.themeBalham.withPart(window.agGrid.colorSchemeLight);
         }
-    };
-    const booleanFilterParams = {
-        filterOptions: ['equals'],
-        defaultOption: 'equals',
-        filterPlaceholder: '1=TRUE, 0=FALSE...'
-    };
+        return window.agGrid.themeBalham.withPart(window.agGrid.colorSchemeDark);
+    }
 
     // Inject raw JSON data from R
     const data = ${content};
+    const emptyCellRenderer = () => '';
+
+    function clearLongFetchTimer() {
+        if (longFetchTimer) {
+            clearTimeout(longFetchTimer);
+            longFetchTimer = undefined;
+        }
+    }
+
+    function setFetchStatus(state, message, showRetry) {
+        const statusElement = document.querySelector('#fetchStatus');
+        const textElement = document.querySelector('#fetchStatusText');
+        if (!statusElement || !textElement) {
+            return;
+        }
+        if (state === 'hidden') {
+            statusElement.classList.remove('visible', 'show-retry');
+            statusElement.dataset.state = '';
+            textElement.textContent = '';
+            return;
+        }
+        statusElement.dataset.state = state;
+        textElement.textContent = message;
+        statusElement.classList.add('visible');
+        statusElement.classList.toggle('show-retry', Boolean(showRetry));
+    }
+
+    function updateFetchStatusPosition() {
+        const containerElement = document.querySelector('#gridContainer');
+        if (!containerElement) {
+            return;
+        }
+        let headerHeight = 0;
+        if (gridApi && typeof gridApi.getSizesForCurrentTheme === 'function') {
+            const sizes = gridApi.getSizesForCurrentTheme();
+            if (sizes && Number.isFinite(sizes.headerHeight)) {
+                headerHeight = Number(sizes.headerHeight);
+            }
+        }
+        if (!headerHeight) {
+            const headerElement = document.querySelector('#myGrid .ag-header');
+            if (headerElement) {
+                headerHeight = headerElement.getBoundingClientRect().height;
+            }
+        }
+        const topOffset = Math.max(8, Math.round(headerHeight) + 8);
+        containerElement.style.setProperty('--fetch-status-top', String(topOffset) + 'px');
+    }
+
+    function beginFetch(message) {
+        activeFetches += 1;
+        if (activeFetches !== 1) {
+            return;
+        }
+        setFetchStatus('loading', message || 'Fetching data...', false);
+        clearLongFetchTimer();
+        longFetchTimer = setTimeout(() => {
+            if (activeFetches > 0) {
+                setFetchStatus(
+                    'warning',
+                    'Still waiting for R session response. It may be busy running code.',
+                    false
+                );
+            }
+        }, LONG_FETCH_DELAY_MS);
+    }
+
+    function finishFetch(ok, errorMessage) {
+        activeFetches = Math.max(0, activeFetches - 1);
+        if (activeFetches !== 0) {
+            return;
+        }
+        clearLongFetchTimer();
+        if (ok) {
+            setFetchStatus('hidden', '', false);
+        } else {
+            setFetchStatus(
+                'error',
+                errorMessage || 'Failed to fetch data from R session.',
+                true
+            );
+        }
+    }
+
+    function retryCurrentPage() {
+        if (!gridApi) {
+            return;
+        }
+        setFetchStatus('loading', 'Retrying data fetch...', false);
+        if (typeof gridApi.refreshInfiniteCache === 'function') {
+            gridApi.refreshInfiniteCache();
+        } else {
+            gridApi.purgeInfiniteCache();
+        }
+    }
+
+    function updateScrollPosition() {
+        if (!scrollbarPressed || !verticalScrollbar) {
+            return;
+        }
+        const positionElement = document.querySelector('#scrollPosition');
+        const containerElement = document.querySelector('#gridContainer');
+        if (!positionElement || !containerElement || filteredRows < 1) {
+            return;
+        }
+
+        const trackHeight = verticalScrollbar.clientHeight;
+        const maximumScroll = verticalScrollbar.scrollHeight - trackHeight;
+        const scrollRatio = maximumScroll > 0
+            ? Math.max(0, Math.min(1, verticalScrollbar.scrollTop / maximumScroll))
+            : 0;
+        const currentRow = Math.round(scrollRatio * (filteredRows - 1)) + 1;
+        positionElement.textContent =
+            rowNumberFormatter.format(currentRow) +
+            ' of ' + rowNumberFormatter.format(filteredRows);
+
+        const scrollbarRect = verticalScrollbar.getBoundingClientRect();
+        const containerRect = containerElement.getBoundingClientRect();
+        const labelHeight = positionElement.offsetHeight;
+        const desiredTop = scrollbarRect.top - containerRect.top +
+            scrollRatio * Math.max(0, scrollbarRect.height - labelHeight);
+        const maximumTop = containerRect.height - labelHeight - 8;
+        positionElement.style.top =
+            String(Math.max(8, Math.min(desiredTop, maximumTop))) + 'px';
+    }
+
+    function attachScrollbarPositionIndicator() {
+        if (scrollbarPositionAttached) {
+            return;
+        }
+        verticalScrollbar = document.querySelector(
+            '#myGrid .ag-body-vertical-scroll-viewport'
+        );
+        if (!verticalScrollbar) {
+            return;
+        }
+        scrollbarPositionAttached = true;
+        verticalScrollbar.addEventListener('pointerdown', () => {
+            scrollbarPressed = true;
+            const positionElement = document.querySelector('#scrollPosition');
+            positionElement?.classList.add('visible');
+            updateScrollPosition();
+        });
+        verticalScrollbar.addEventListener('scroll', updateScrollPosition, {
+            passive: true
+        });
+        const hidePosition = () => {
+            scrollbarPressed = false;
+            document.querySelector('#scrollPosition')?.classList.remove('visible');
+        };
+        window.addEventListener('pointerup', hidePosition);
+        window.addEventListener('pointercancel', hidePosition);
+    }
 
     const displayDataSource = {
         getRows(params) {
+            beginFetch('Fetching rows from R session...');
             const msg = {
                 command: 'fetchRows',
                 start: params.startRow,
@@ -862,7 +1056,7 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
                 filterModel: params.filterModel,
                 requestId: Math.random().toString(36).substr(2, 9)
             };
-            
+
             const handler = event => {
                 const m = event.data;
                 if (m.requestId !== msg.requestId) {
@@ -871,30 +1065,31 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
 
                 if (m.command === 'fetchedRows') {
                     if (m.generation !== msg.generation) {
-                        const overlay = document.getElementById('loadingOverlay');
-                        if (overlay) overlay.classList.add('hidden');
                         params.failCallback();
+                        finishFetch(true);
                         window.removeEventListener('message', handler);
                         return;
                     }
-            
-                    if (!hasReceivedFirstRows) {
-                        hasReceivedFirstRows = true;
-                        const overlay = document.getElementById('loadingOverlay');
-                        if (overlay) overlay.classList.add('hidden');
-                    }
 
-                    displayDataSource._TotalRows = m.totalRows;
-                    displayDataSource._TotalUnfiltered = m.totalUnfiltered;
-                    displayDataSource.api?.refreshHeader();
+                    filteredRows = m.totalRows;
+                    totalRows = m.totalUnfiltered;
+                    isFiltered = Object.keys(params.filterModel || {}).length > 0;
+                    gridApi?.refreshHeader();
+                    updateScrollPosition();
 
-                    const totalRows = m.totalRows;
-                    params.successCallback(m.rows, totalRows);
+                    m.rows.forEach(row => {
+                        bigintFields.forEach(field => {
+                            if (row[field] != null) {
+                                row[field] = BigInt(row[field]);
+                            }
+                        });
+                    });
+                    params.successCallback(m.rows, m.totalRows);
+                    finishFetch(true);
                     window.removeEventListener('message', handler);
                 } else if (m.command === 'fetchError') {
-                    const overlay = document.getElementById('loadingOverlay');
-                    if (overlay) overlay.classList.add('hidden');
                     params.failCallback();
+                    finishFetch(false, 'Failed to fetch rows from R session.');
                     window.removeEventListener('message', handler);
                 }
             };
@@ -903,120 +1098,95 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
         }
     };
 
-    const columnDefs = data.columns.map(col => {
-        if (col.type === "booleanColumn") {
-          return {
-            ...col,
-            valueFormatter: params =>
-              params.value === true ? 'TRUE' :
-              params.value === false ? 'FALSE' :
-              params.value === 'NA' ? 'NA' : params.value
-          };
-        } else if (col.type === "dateColumn") {
-          return { ...col, width: 200 };
+    const columnDefs = data.columns.map(sourceColumn => {
+        const column = { ...sourceColumn };
+        if (column.field === 'x1') {
+            column.lockPosition = 'left';
+            column.width = 150;
+            column.headerValueGetter = () =>
+                isFiltered
+                    ? '(' + rowNumberFormatter.format(filteredRows) + '/' +
+                        rowNumberFormatter.format(totalRows) + ')'
+                    : '';
+        } else if (column.field === 'x2') {
+            column.hide = true;
         }
-      
-        if (col.field === "x2") {
-          return { ...col, hide: true };
-        }
-        else if (col.field === "x1") {
-          return {
-            ...col,
-            sortable: false,
-            filter: false,
-            lockPosition: 'left',
-            suppressHeaderMenuButton: true,
-            width: 150,
-            headerValueGetter: () => {
-              const a = displayDataSource._TotalRows || 0;
-              const b = displayDataSource._TotalUnfiltered || 0;
-              return '(' + a + '/' + b + ')';
-            }
-          };
-        }
-        return col;
-      });
-    
-    const gridOptions = {
-        defaultColDef: {
-            sortable: true,
-            resizable: true,
-            filter: true,
-            width: 150,
-            minWidth: 100,
-            floatingFilter: true, 
-            suppressHeaderMenuButton: true,
-            lockPinned: true,
-            filterParams: {
-                buttons: ['apply', 'reset'],
-                closeOnApply: true,
-                maxNumConditions: 1
-            }
-        },
-        
-        columnDefs: columnDefs,
-        getRowId: params => params.data.x2,
 
-        suppressColumnVirtualisation: false,
-        alwaysShowVerticalScroll: true,
-        debounceVerticalScrollbar: false,
-        
-        ensureDomOrder: true,
-        rowHeight: 25,
-        rowModelType: 'infinite',
-        cacheBlockSize: 100,                    // Increased from 50
-        maxBlocksInCache: 100,
-        infiniteInitialRowCount: 100,           // Show 100 placeholder rows
-        cacheOverflowSize: 2,
-        maxConcurrentDatasourceRequests: 2,
-        blockLoadDebounceMillis: 0,
-        
-        rowBuffer: 50,
-        rowSelection: 'multiple',
-        enableCellTextSelection: true,
-        suppressRowTransform: true,
-        animateRows: false
-      };
+        if (column.type === 'booleanColumn') {
+            column.cellRendererSelector = params =>
+                params.data == null
+                    ? { component: emptyCellRenderer }
+                    : undefined;
+        } else if (column.type === 'dateColumn' ||
+                   column.type === 'datetimeColumn') {
+            column.cellDataType =
+                column.type === 'dateColumn' ? 'dateString' : 'dateTimeString';
+            column.filter = 'agDateColumnFilter';
+            column.filterParams = dateFilterParams;
+            column.width = 200;
+        } else if (column.type === 'bigintColumn') {
+            column.cellDataType = 'bigint';
+            column.filter = 'agBigIntColumnFilter';
+            bigintFields.push(column.field);
+        }
+        if (column.type !== 'numericColumn') {
+            delete column.type;
+        }
+        return column;
+    });
+
+    function getGridOptions() {
+        return {
+            theme: getAgTheme(),
+            defaultColDef: {
+                sortable: true,
+                resizable: true,
+                filter: true,
+                width: 100,
+                minWidth: 50,
+                filterParams: {
+                    buttons: ['reset', 'apply']
+                }
+            },
+
+            columnDefs: columnDefs,
+            getRowId: params => params.data.x2,
+            rowModelType: 'infinite',
+            datasource: displayDataSource,
+            cacheBlockSize: 500,
+            enableCellTextSelection: true,
+            ensureDomOrder: true,
+            tooltipShowDelay: 100,
+            onBodyScroll: updateScrollPosition,
+            onFirstDataRendered: params => {
+                params.api.autoSizeAllColumns(false);
+                updateFetchStatusPosition();
+                attachScrollbarPositionIndicator();
+            },
+        };
+    }
     
     function updateTheme() {
-        const gridDiv = document.querySelector('#myGrid');
-        if (document.body.classList.contains('vscode-light')) {
-            gridDiv.className = 'ag-theme-balham';
-        } else {
-            gridDiv.className = 'ag-theme-balham-dark';
+        if (gridApi) {
+            gridApi.setGridOption('theme', getAgTheme());
         }
+        updateFetchStatusPosition();
     }
     
     document.addEventListener('DOMContentLoaded', () => {
-        gridOptions.columnDefs.forEach(column => {
-            if (column.type === 'dateColumn') {
-                column.filterParams = dateFilterParams;
-            }
-            else if (column.type == 'booleanColumn') {
-                column.filterParams = booleanFilterParams;
-            }
-        });
-        
+        const retryButton = document.querySelector('#fetchRetryBtn');
+        if (retryButton) {
+            retryButton.addEventListener('click', retryCurrentPage);
+        }
         const gridDiv = document.querySelector('#myGrid');
-        const gridApi = agGrid.createGrid(gridDiv, gridOptions);
+        gridApi = window.agGrid.createGrid(gridDiv, getGridOptions());
 
-        displayDataSource.api = gridApi;        
-        gridApi.setGridOption('datasource', displayDataSource);
-
-        // Auto-size columns early (even before rows)
-        setTimeout(() => {
-            const cols = columnDefs.filter(col => col.field !== 'x1').map(col => col.field);
-            gridApi.autoSizeColumns(cols, false);
-        }, 100);
+        updateTheme();
+        requestAnimationFrame(attachScrollbarPositionIndicator);
 
         window.addEventListener('message', event => {
             const msg = event.data;
             if (msg.command === 'refreshDataview') {
-              
-              hasReceivedFirstRows = false;
-              const overlay = document.getElementById('loadingOverlay');
-              if (overlay) overlay.classList.remove('hidden');
-
               gridApi.setFilterModel(null);
               gridApi.onFilterChanged();            
               gridApi.purgeInfiniteCache();           
@@ -1036,12 +1206,14 @@ export async function getTableHtml(webview: Webview, file: string): Promise<stri
     </script>
 </head>
 <body onload='onload()'>
-    <!-- NEW: Loading overlay with spinner -->
-    <div id="loadingOverlay">
-        <div class="spinner">⟳</div>
-        <div>Loading...</div>
+    <div id="gridContainer">
+        <div id="fetchStatus" role="status" aria-live="polite">
+            <span id="fetchStatusText"></span>
+            <button id="fetchRetryBtn" type="button">Retry</button>
+        </div>
+        <div id="scrollPosition" role="status" aria-live="polite"></div>
+        <div id="myGrid" style="height: 100%;"></div>
     </div>
-    <div id="myGrid" style="height: 100%;"></div>
 </body>
 </html>
 `;
