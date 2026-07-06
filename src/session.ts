@@ -875,6 +875,33 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
     #fetchStatus.show-retry #fetchRetryBtn {
         display: inline-block;
     }
+
+    #scrollPosition {
+        position: absolute;
+        top: 52px;
+        right: 24px;
+        z-index: 21;
+        display: none;
+        padding: 4px 8px;
+        border: 1px solid var(--vscode-panel-border);
+        border-radius: 4px;
+        background-color: var(--vscode-editorWidget-background);
+        color: var(--vscode-editorWidget-foreground);
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+        font-size: 12px;
+        pointer-events: none;
+        white-space: nowrap;
+    }
+
+    #scrollPosition.visible {
+        display: block;
+    }
+
+    .dataview-na {
+        color: var(--vscode-descriptionForeground);
+        font-style: italic;
+        opacity: 0.75;
+    }
     </style>
     <script src="${String(webview.asWebviewUri(Uri.file(path.join(resDir, 'ag-grid-community.min.noStyle.js'))))}"></script>
     <script>
@@ -884,7 +911,21 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
     let gridApi;
     let activeFetches = 0;
     let longFetchTimer;
+    let filteredRows = 0;
+    let totalRows = 0;
+    let isFiltered = false;
+    let verticalScrollbar;
+    let scrollbarPositionAttached = false;
+    let scrollbarPressed = false;
     const LONG_FETCH_DELAY_MS = 2000;
+    const rowNumberFormatter = new Intl.NumberFormat();
+    const emptyCellRenderer = () => '';
+    const naCellRenderer = () => {
+        const element = document.createElement('span');
+        element.className = 'dataview-na';
+        element.textContent = 'NA';
+        return element;
+    };
 
     function clearLongFetchTimer() {
         if (longFetchTimer) {
@@ -977,6 +1018,84 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
         }
     }
 
+    function updateScrollPosition() {
+        if (!scrollbarPressed || !verticalScrollbar || !gridApi) {
+            return;
+        }
+
+        const positionEl = document.querySelector('#scrollPosition');
+        const containerEl = document.querySelector('#gridContainer');
+        if (!positionEl || !containerEl || filteredRows < 1) {
+            return;
+        }
+
+        const maximumScroll =
+            verticalScrollbar.scrollHeight - verticalScrollbar.clientHeight;
+        const scrollRatio = maximumScroll > 0
+            ? Math.max(0, Math.min(1, verticalScrollbar.scrollTop / maximumScroll))
+            : 0;
+
+        let pageStart = 0;
+        let rowsInView = filteredRows;
+        if (${pageSize > 0 ? 'true' : 'false'} &&
+            typeof gridApi.paginationGetCurrentPage === 'function' &&
+            typeof gridApi.paginationGetPageSize === 'function') {
+            pageStart =
+                gridApi.paginationGetCurrentPage() * gridApi.paginationGetPageSize();
+            pageStart = Math.min(pageStart, Math.max(0, filteredRows - 1));
+            rowsInView = Math.min(
+                gridApi.paginationGetPageSize(),
+                filteredRows - pageStart
+            );
+        }
+        const currentRow = Math.min(
+            filteredRows,
+            pageStart + Math.round(scrollRatio * Math.max(0, rowsInView - 1)) + 1
+        );
+        positionEl.textContent =
+            rowNumberFormatter.format(currentRow) +
+            ' of ' + rowNumberFormatter.format(filteredRows);
+
+        const scrollbarRect = verticalScrollbar.getBoundingClientRect();
+        const containerRect = containerEl.getBoundingClientRect();
+        const labelHeight = positionEl.offsetHeight;
+        const desiredTop = scrollbarRect.top - containerRect.top +
+            scrollRatio * Math.max(0, scrollbarRect.height - labelHeight);
+        const maximumTop = containerRect.height - labelHeight - 8;
+        positionEl.style.top =
+            String(Math.max(8, Math.min(desiredTop, maximumTop))) + 'px';
+    }
+
+    function attachScrollbarPositionIndicator() {
+        if (scrollbarPositionAttached) {
+            return;
+        }
+
+        verticalScrollbar = document.querySelector(
+            '#myGrid .ag-body-vertical-scroll-viewport'
+        );
+        if (!verticalScrollbar) {
+            return;
+        }
+
+        scrollbarPositionAttached = true;
+        verticalScrollbar.addEventListener('pointerdown', () => {
+            scrollbarPressed = true;
+            document.querySelector('#scrollPosition')?.classList.add('visible');
+            updateScrollPosition();
+        });
+        verticalScrollbar.addEventListener('scroll', updateScrollPosition, {
+            passive: true
+        });
+
+        const hidePosition = () => {
+            scrollbarPressed = false;
+            document.querySelector('#scrollPosition')?.classList.remove('visible');
+        };
+        window.addEventListener('pointerup', hidePosition);
+        window.addEventListener('pointercancel', hidePosition);
+    }
+
     function request(action, payload) {
         const requestId = requestIdSeq++;
         return new Promise((resolve, reject) => {
@@ -1048,15 +1167,25 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
         }
 
         const columns = Array.isArray(init.columns) ? init.columns : [];
-        let filteredRows = init.totalRows;
-        let totalRows = init.totalRows;
-        let isFiltered = false;
+        filteredRows = init.totalRows;
+        totalRows = init.totalRows;
         const bigintFields = [];
         
         columns.forEach((column) => {
+            column.cellRendererSelector = params => {
+                if (params.data == null) {
+                    return { component: emptyCellRenderer };
+                }
+                return params.value == null
+                    ? { component: naCellRenderer }
+                    : undefined;
+            };
             if (column.field === '0') {
                 column.headerValueGetter = () =>
-                    isFiltered ? '(' + filteredRows + '/' + totalRows + ')' : '';
+                    isFiltered
+                        ? '(' + rowNumberFormatter.format(filteredRows) +
+                            '/' + rowNumberFormatter.format(totalRows) + ')'
+                        : '';
             }
             if (column.type === 'dateColumn' || column.type === 'datetimeColumn') {
                 column.cellDataType =
@@ -1090,6 +1219,7 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
                     totalRows = result.totalUnfiltered;
                     isFiltered = Object.keys(params.filterModel || {}).length > 0;
                     gridApi?.refreshHeader();
+                    updateScrollPosition();
                     const resolvedLastRow = Number.isFinite(result.totalRows) ? result.totalRows : result.lastRow;
                     const rows = result.rows || [];
                     rows.forEach((row) => {
@@ -1132,11 +1262,11 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
             enableCellTextSelection: true,
             ensureDomOrder: true,
             tooltipShowDelay: 100,
+            onPaginationChanged: updateScrollPosition,
             onFirstDataRendered: function(params) {
-                if (params.columnApi) {
-                    params.columnApi.autoSizeAllColumns(false);
-                }
+                params.api.autoSizeAllColumns(false);
                 updateFetchStatusPosition();
+                attachScrollbarPositionIndicator();
             }
         };
 
@@ -1181,6 +1311,7 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
 <body>
     <div id="gridContainer">
         <div id="myGrid" style="height: 100%;"></div>
+        <div id="scrollPosition" role="status" aria-live="polite"></div>
         <div id="fetchStatus" data-state="" role="status" aria-live="polite">
             <span id="fetchStatusText"></span>
             <button id="fetchRetryBtn" type="button">Retry</button>
