@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.2.2 - 2026-07-08
+
+### Bug Fixes
+
+* Fixed workspace viewer expansion for R6 environments such as `mlr3` tasks by using the visible environment binding list for both child counts and child pages.
+
 ## 3.2.1 - 2026-07-06
 
 ### Bug Fixes

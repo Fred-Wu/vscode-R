@@ -864,9 +864,13 @@ address <- function(x) {
 
 globalenv_cache <- new.env(parent = emptyenv())
 
+workspace_env_names <- function(env) {
+    ls(env, sorted = FALSE)
+}
+
 workspace_child_count <- function(obj) {
     if (is.environment(obj)) {
-        length(obj)
+        length(workspace_env_names(obj))
     } else if (isS4(obj)) {
         length(slotNames(obj))
     } else if (typeof(obj) %in% c("list", "pairlist")) {
@@ -877,7 +881,7 @@ workspace_child_count <- function(obj) {
 }
 
 inspect_env <- function(env, cache) {
-    all_names <- ls(env, sorted = FALSE)
+    all_names <- workspace_env_names(env)
     stale_names <- setdiff(names(cache), all_names)
     if (length(stale_names)) {
         rm(list = stale_names, envir = cache)
@@ -1033,7 +1037,7 @@ workspace_child_page <- function(name, path = list(), start = 1L) {
         }
 
         children <- if (is.environment(object)) {
-            child_names <- ls(object, sorted = FALSE)[seq.int(start, end)]
+            child_names <- workspace_env_names(object)[seq.int(start, end)]
             lapply(child_names, function(child_name) {
                 if (bindingIsActive(child_name, object)) {
                     list(
