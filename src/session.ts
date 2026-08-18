@@ -232,9 +232,6 @@ export const activeConnections = new Set<IpcSocket>();
 
 const pendingRequests = new Map<number, { resolve: (value: unknown) => void, reject: (reason?: unknown) => void }>();
 
-// Per-socket read buffers for NDJSON framing
-const readBuffers = new Map<IpcSocket, string>();
-
 let globalSessionServer: net.Server | undefined;
 let attachSessionScriptPath: string | undefined;
 
@@ -321,50 +318,84 @@ export async function getGlobalPipePath(): Promise<string> {
             console.info('[SessionServer] Client connected via IPC pipe');
             activeConnections.add(socket);
             pipeClient = socket;
-            readBuffers.set(socket, '');
+
+            let readBuffers: Buffer[] = [];
+            let readBufferLength = 0;
+
+            const handleLine = (buf: Buffer) => {
+                let lineEnd = buf.length;
+                if (lineEnd > 0 && buf[lineEnd - 1] === 0x0d) {
+                    lineEnd--;
+                }
+                if (lineEnd === 0) {
+                    return;
+                }
+
+                const line = buf.toString('utf8', 0, lineEnd);
+                void (async () => {
+                    try {
+                        const message = JSON.parse(line) as Record<string, unknown>;
+                        if (message.id !== undefined && !message.method) {
+                            // Response to a request we sent
+                            const id = Number(message.id);
+                            const pending = pendingRequests.get(id);
+                            if (pending) {
+                                pendingRequests.delete(id);
+                                if (message.error) {
+                                    pending.reject(message.error);
+                                } else {
+                                    pending.resolve(message.result);
+                                }
+                            }
+                        } else if (message.id === undefined || message.id === null) {
+                            await handleNotification(message, socket);
+                        } else {
+                            await handleRequest(message, socket);
+                        }
+                    } catch (e) {
+                        console.error('[SessionServer] Error handling message', e);
+                    }
+                })();
+            };
 
             socket.on('data', (data: Buffer) => {
-                const incoming = data.toString('utf8');
-                const buf = (readBuffers.get(socket) ?? '') + incoming;
-                const lines = buf.split('\n');
-                // Last element is a potentially incomplete line — keep in buffer
-                readBuffers.set(socket, lines[lines.length - 1]);
+                let start = 0;
+                let newline = data.indexOf(0x0a, start);
 
-                for (let i = 0; i < lines.length - 1; i++) {
-                    const line = lines[i].trim();
-                    if (!line) {
-                        continue;
-                    }
-                    void (async () => {
-                        try {
-                            const message = JSON.parse(line) as Record<string, unknown>;
-                            if (message.id !== undefined && !message.method) {
-                                // Response to a request we sent
-                                const id = Number(message.id);
-                                const pending = pendingRequests.get(id);
-                                if (pending) {
-                                    pendingRequests.delete(id);
-                                    if (message.error) {
-                                        pending.reject(message.error);
-                                    } else {
-                                        pending.resolve(message.result);
-                                    }
-                                }
-                            } else if (message.id === undefined || message.id === null) {
-                                await handleNotification(message, socket);
-                            } else {
-                                await handleRequest(message, socket);
-                            }
-                        } catch (e) {
-                            console.error('[SessionServer] Error handling message', e);
+                while (newline !== -1) {
+                    const incoming = data.subarray(start, newline);
+                    let buf: Buffer;
+
+                    if (readBuffers.length === 0) {
+                        buf = incoming;
+                    } else {
+                        if (incoming.length > 0) {
+                            readBuffers.push(incoming);
+                            readBufferLength += incoming.length;
                         }
-                    })();
+                        buf = readBuffers.length === 1
+                            ? readBuffers[0]
+                            : Buffer.concat(readBuffers, readBufferLength);
+                        readBuffers = [];
+                        readBufferLength = 0;
+                    }
+
+                    handleLine(buf);
+                    start = newline + 1;
+                    newline = data.indexOf(0x0a, start);
+                }
+
+                if (start < data.length) {
+                    const incoming = data.subarray(start);
+                    readBuffers.push(incoming);
+                    readBufferLength += incoming.length;
                 }
             });
 
             socket.on('close', () => {
                 console.info('[SessionServer] Client disconnected');
-                readBuffers.delete(socket);
+                readBuffers = [];
+                readBufferLength = 0;
                 activeConnections.delete(socket);
                 if (pipeClient === socket) {
                     pipeClient = undefined;
@@ -464,7 +495,6 @@ export async function shutdownSessionWatcher(): Promise<void> {
     }
     activeConnections.clear();
     pipeClient = undefined;
-    readBuffers.clear();
 
     if (globalSessionServer) {
         await new Promise<void>((resolve) => {
