@@ -17,6 +17,7 @@ import { extensionContext, homeExtDir, rWorkspace, globalRHelp, globalPlotManage
 import { resolveBackend, CommonPlotManager } from './plotViewer';
 
 import { showWebView } from './webViewer';
+import { getDataViewerColumnPanelHtml, getDataViewerColumnPanelScript, getDataViewerColumnPanelStyle } from './dataViewerColumnPanel';
 
 export interface SessionInfo {
     version: string;
@@ -932,6 +933,7 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
         font-style: italic;
         opacity: 0.75;
     }
+    ${getDataViewerColumnPanelStyle()}
     </style>
     <script src="${String(webview.asWebviewUri(Uri.file(path.join(resDir, 'ag-grid-community.min.noStyle.js'))))}"></script>
     <script>
@@ -939,6 +941,7 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
     let requestIdSeq = 1;
     const pending = new Map();
     let gridApi;
+    ${getDataViewerColumnPanelScript()}
     let activeFetches = 0;
     let longFetchTimer;
     let filteredRows = 0;
@@ -1292,6 +1295,8 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
             enableCellTextSelection: true,
             ensureDomOrder: true,
             tooltipShowDelay: 100,
+            onColumnMoved: syncColumnPanelFromGrid,
+            onColumnVisible: syncColumnPanelFromGrid,
             onPaginationChanged: updateScrollPosition,
             onFirstDataRendered: function(params) {
                 params.api.autoSizeAllColumns(false);
@@ -1304,6 +1309,7 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
         try {
             console.log('[dataview] Creating grid with options:', gridOptions);
             gridApi = window.agGrid.createGrid(gridDiv, gridOptions);
+            initializeColumnPanel();
             console.log('[dataview] Grid created successfully');
             updateFetchStatusPosition();
         } catch (e) {
@@ -1341,6 +1347,7 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
 <body>
     <div id="gridContainer">
         <div id="myGrid" style="height: 100%;"></div>
+        ${getDataViewerColumnPanelHtml()}
         <div id="scrollPosition" role="status" aria-live="polite"></div>
         <div id="fetchStatus" data-state="" role="status" aria-live="polite">
             <span id="fetchStatusText"></span>
