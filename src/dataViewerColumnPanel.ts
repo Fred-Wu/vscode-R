@@ -2,22 +2,80 @@
 
 export function getDataViewerColumnPanelStyle(): string {
     return `
-    #columnPanelToggle {
-        position: absolute;
-        top: 8px;
-        right: 8px;
+    #gridContainer {
+        display: flex;
+        position: relative;
+        height: 100%;
+        width: 100%;
+        overflow: hidden;
+    }
+
+    #myGrid {
+        flex: 1 1 auto;
+        min-width: 0;
+    }
+
+    #columnPanelToolbar {
+        flex: 0 0 34px;
+        width: 34px;
+        height: 100%;
+        box-sizing: border-box;
+        border-left: 1px solid var(--vscode-panel-border);
+        background-color: var(--vscode-sideBar-background);
+        display: flex;
+        justify-content: center;
+        align-items: flex-start;
+        padding-top: 6px;
         z-index: 25;
-        border: 1px solid var(--vscode-button-border, transparent);
-        padding: 4px 10px;
-        background-color: var(--vscode-button-secondaryBackground);
-        color: var(--vscode-button-secondaryForeground);
+    }
+
+    #columnPanelToggle {
+        width: 28px;
+        height: 28px;
+        padding: 0;
+        border: 0;
+        background: transparent;
+        color: var(--vscode-foreground);
         cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    #columnPanelToggle:hover {
+        background-color: var(--vscode-toolbar-hoverBackground);
+    }
+
+    #columnPanelToggle span,
+    #columnPanelToggle span::before,
+    #columnPanelToggle span::after {
+        display: block;
+        width: 14px;
+        height: 1.5px;
+        background-color: currentColor;
+        content: '';
+    }
+
+    #columnPanelToggle span {
+        position: relative;
+    }
+
+    #columnPanelToggle span::before {
+        position: absolute;
+        top: -5px;
+        left: 0;
+    }
+
+    #columnPanelToggle span::after {
+        position: absolute;
+        top: 5px;
+        left: 0;
     }
 
     #columnPanel {
         position: absolute;
         top: 0;
-        right: 0;
+        right: 34px;
         z-index: 30;
         display: none;
         width: min(320px, 42vw);
@@ -111,7 +169,9 @@ export function getDataViewerColumnPanelStyle(): string {
 
 export function getDataViewerColumnPanelHtml(): string {
     return `
-        <button id="columnPanelToggle" type="button">Columns</button>
+        <div id="columnPanelToolbar">
+            <button id="columnPanelToggle" type="button" aria-label="Columns" title="Columns"><span></span></button>
+        </div>
         <div id="columnPanel" aria-label="Columns panel">
             <div id="columnPanelHeader">
                 <span>Columns</span>
@@ -128,8 +188,8 @@ export function getDataViewerColumnPanelHtml(): string {
 
 export function getDataViewerColumnPanelScript(): string {
     return `
-    let columnPanelColumns = [];
     let draggedColumnId;
+    let restoringIndexColumn = false;
 
     function getSelectableGridColumns() {
         if (!gridApi || typeof gridApi.getAllGridColumns !== 'function') {
@@ -149,10 +209,10 @@ export function getDataViewerColumnPanelScript(): string {
             return;
         }
 
+        const scrollTop = list.scrollTop;
         list.replaceChildren();
-        columnPanelColumns = getSelectableGridColumns();
 
-        columnPanelColumns.forEach(column => {
+        getSelectableGridColumns().forEach(column => {
             const colId = column.getColId();
             const item = document.createElement('div');
             item.className = 'column-panel-item';
@@ -175,6 +235,34 @@ export function getDataViewerColumnPanelScript(): string {
             item.append(checkbox, label);
             list.append(item);
         });
+
+        list.scrollTop = scrollTop;
+    }
+
+    function ensureIndexColumnFirst() {
+        if (!gridApi || restoringIndexColumn) {
+            return;
+        }
+
+        const allColumns = gridApi.getAllGridColumns();
+        if (!allColumns.length || allColumns[0].getColId() === '0') {
+            return;
+        }
+
+        const indexColumn = allColumns.find(column => column.getColId() === '0');
+        if (!indexColumn) {
+            return;
+        }
+
+        restoringIndexColumn = true;
+        gridApi.applyColumnState({
+            state: [
+                { colId: '0' },
+                ...allColumns.filter(column => column.getColId() !== '0').map(column => ({ colId: column.getColId() }))
+            ],
+            applyOrder: true
+        });
+        restoringIndexColumn = false;
     }
 
     function applyPanelOrder() {
@@ -188,7 +276,7 @@ export function getDataViewerColumnPanelScript(): string {
             .filter(Boolean);
 
         gridApi.applyColumnState({
-            state: orderedIds.map(colId => ({ colId })),
+            state: [{ colId: '0' }, ...orderedIds.map(colId => ({ colId }))],
             applyOrder: true
         });
     }
@@ -213,6 +301,7 @@ export function getDataViewerColumnPanelScript(): string {
             return;
         }
 
+        ensureIndexColumnFirst();
         renderColumnPanel();
 
         toggle.addEventListener('click', () => {
@@ -253,7 +342,7 @@ export function getDataViewerColumnPanelScript(): string {
             event.preventDefault();
             const target = event.target.closest('.column-panel-item');
             const dragged = draggedColumnId
-                ? list.querySelector('[data-col-id="' + CSS.escape(draggedColumnId) + '"]')
+                ? Array.from(list.children).find(item => item.dataset.colId === draggedColumnId)
                 : undefined;
             if (!target || !dragged || target === dragged) {
                 return;
@@ -267,7 +356,13 @@ export function getDataViewerColumnPanelScript(): string {
         });
     }
 
-    function syncColumnPanelFromGrid() {
+    function syncColumnPanelFromGrid(event) {
+        if (event?.type === 'columnMoved' && event.finished === false) {
+            return;
+        }
+
+        ensureIndexColumnFirst();
+
         const panel = document.querySelector('#columnPanel');
         if (panel?.classList.contains('visible')) {
             renderColumnPanel();
