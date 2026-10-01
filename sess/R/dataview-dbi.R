@@ -3,8 +3,8 @@ dataview_is_dbi_lazy <- function(data) {
 }
 
 dataview_dbi_is_bare_table <- function(data) {
-  inherits(data$lazy_query, "lazy_base_remote_query") &&
-    inherits(data$lazy_query$x, "dbplyr_table_path")
+  table <- dbplyr::remote_table(data)
+  !is.null(table) && !dbplyr::is.sql(table)
 }
 
 dataview_dbi_cache_block_size <- 1000L
@@ -21,7 +21,7 @@ dataview_dbi_require <- function() {
 
 dataview_dbi_source <- function(data) {
   dataview_dbi_require()
-  con <- data$src$con
+  con <- dbplyr::remote_con(data)
   if (!inherits(con, "DBIConnection") || !DBI::dbIsValid(con)) {
     stop("the lazy table does not have a valid DBI connection")
   }
@@ -35,17 +35,18 @@ dataview_dbi_source <- function(data) {
 
   # Keep the source ordering for the outer Data Viewer query, not inside the subquery.
   order <- dbplyr::op_sort(data)
-  source_sql <- suppressWarnings(dbplyr::sql_render(data, subquery = TRUE))
+  source_sql <- if (dataview_dbi_is_bare_table(data)) {
+    dbplyr::remote_table(data)
+  } else {
+    suppressWarnings(dbplyr::sql_render(data, subquery = TRUE))
+  }
+  schema <- DBI::dbGetQuery(
+    con,
+    as.character(dbplyr::sql_query_fields(con, source_sql))
+  )
   from_sql <- as.character(
     dbplyr::sql_query_wrap(con, source_sql, name = "dataview_source")
   )
-  # Extension point for other database backends / SQL dialects: start
-  # Schema probing currently uses SQL Server TOP.
-  schema <- DBI::dbGetQuery(
-    con,
-    paste0("select top (0) * from ", from_sql)
-  )
-  # Extension point for other database backends / SQL dialects: end
   source_order <- if (length(order)) {
     as.character(dbplyr::translate_sql_(
       order,
@@ -79,13 +80,10 @@ dataview_dbi_source <- function(data) {
 
 dataview_dbi_to_state <- function(data) {
   source <- dataview_dbi_source(data)
-  # Extension point for other database backends / SQL dialects: start
-  # Row counting currently uses SQL Server COUNT_BIG.
   total_rows <- DBI::dbGetQuery(
     source$con,
     paste0("select count_big(*) as n from ", source$from_sql)
   )[[1L]][[1L]]
-  # Extension point for other database backends / SQL dialects: end
   total_rows <- as.numeric(total_rows)
   if (!is.finite(total_rows) || total_rows < 0 || total_rows > .Machine$integer.max) {
     stop("database result is too large for the current data viewer row index")
