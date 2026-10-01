@@ -94,12 +94,16 @@ export function getDataViewerScript(): string {
             };
             if (column.type === 'dateColumn' || column.type === 'datetimeColumn') {
                 column.cellDataType = column.type === 'dateColumn' ? 'dateString' : 'dateTimeString';
-                column.filter = 'agDateColumnFilter';
-                column.filterParams = { browserDatePicker: true };
+                if (column.filter !== false) {
+                    column.filter = 'agDateColumnFilter';
+                    column.filterParams = { browserDatePicker: true };
+                }
                 column.initialWidth = 200;
             } else if (column.type === 'bigintColumn') {
                 column.cellDataType = 'bigint';
-                column.filter = 'agBigIntColumnFilter';
+                if (column.filter !== false) {
+                    column.filter = 'agBigIntColumnFilter';
+                }
                 bigintFields.push(column.field);
             } else if (column.type === 'numericColumn') {
                 column.cellDataType = 'number';

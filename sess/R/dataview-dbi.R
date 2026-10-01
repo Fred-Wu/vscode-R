@@ -2,6 +2,11 @@ dataview_is_dbi_lazy <- function(data) {
   inherits(data, "tbl_sql")
 }
 
+dataview_dbi_is_bare_table <- function(data) {
+  inherits(data$lazy_query, "lazy_base_remote_query") &&
+    inherits(data$lazy_query$x, "dbplyr_table_path")
+}
+
 dataview_dbi_cache_block_size <- 1000L
 dataview_dbi_sort_block_size <- 5000L
 dataview_dbi_cache_rows <- 20000L
@@ -95,12 +100,20 @@ dataview_dbi_to_state <- function(data) {
     lapply(seq_len(ncol(source$schema)), function(position) source$schema[[position]])
   )
   columns <- .mapply(get_column_def, list(headers, fields, cols), NULL)
+  disable_sort_filter <- !dataview_dbi_is_bare_table(data)
+  if (disable_sort_filter) {
+    for (position in seq_len(ncol(source$schema))) {
+      columns[[position + 1L]]$filter <- jsonlite::unbox(FALSE)
+      columns[[position + 1L]]$sortable <- jsonlite::unbox(FALSE)
+    }
+  }
 
   list(
     dbi = source,
     columns = columns,
     column_names = colnames,
     total_rows = total_rows,
+    disable_sort_filter = disable_sort_filter,
     dbi_cache = dataview_dbi_cache_state()
   )
 }
