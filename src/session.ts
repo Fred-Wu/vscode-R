@@ -117,14 +117,14 @@ interface DataViewColumnDef {
 
 interface DataViewInitResult {
     columns: DataViewColumnDef[];
-    totalRows: number;
+    totalRows?: number;
     columnProjection?: boolean;
 }
 
 interface DataViewPageResult {
     rows: Record<string, unknown>[];
-    totalRows: number;
-    totalUnfiltered: number;
+    totalRows?: number;
+    totalUnfiltered?: number;
     lastRow: number;
 }
 
@@ -189,7 +189,8 @@ function attachDynamicDataViewBridge(panel: vscode.WebviewPanel, viewId: string,
                 if (disposed) {
                     return;
                 }
-                if (!result || !Array.isArray(result.columns) || typeof result.totalRows !== 'number') {
+                if (!result || !Array.isArray(result.columns) ||
+                    (result.totalRows !== undefined && typeof result.totalRows !== 'number')) {
                     throw new Error('Invalid dataview_init response');
                 }
                 panel.title = baseTitle;
@@ -221,8 +222,10 @@ function attachDynamicDataViewBridge(panel: vscode.WebviewPanel, viewId: string,
                         },
                     }, 0, dataViewSession.socket) as DataViewPageResult | undefined;
                     if (!result || !Array.isArray(result.rows) ||
-                        typeof result.totalRows !== 'number' ||
-                        typeof result.totalUnfiltered !== 'number') {
+                        typeof result.lastRow !== 'number' ||
+                        (result.totalRows !== undefined && typeof result.totalRows !== 'number') ||
+                        (result.totalUnfiltered !== undefined &&
+                            typeof result.totalUnfiltered !== 'number')) {
                         throw new Error('Invalid dataview_page response');
                     }
                     if (disposed) {
@@ -1236,6 +1239,7 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
     let longFetchTimer;
     let filteredRows = 0;
     let totalRows = 0;
+    let rowCountKnown = false;
     let isFiltered = false;
     let verticalScrollbar;
     let scrollbarPositionAttached = false;
@@ -1329,7 +1333,7 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
 
         const positionEl = document.querySelector('#scrollPosition');
         const containerEl = document.querySelector('#gridContainer');
-        if (!positionEl || !containerEl || filteredRows < 1) {
+        if (!positionEl || !containerEl) {
             return;
         }
 
@@ -1339,26 +1343,33 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
             ? Math.max(0, Math.min(1, verticalScrollbar.scrollTop / maximumScroll))
             : 0;
 
-        let pageStart = 0;
-        let rowsInView = filteredRows;
-        if (${pageSize > 0 ? 'true' : 'false'} &&
-            typeof gridApi.paginationGetCurrentPage === 'function' &&
-            typeof gridApi.paginationGetPageSize === 'function') {
-            pageStart =
-                gridApi.paginationGetCurrentPage() * gridApi.paginationGetPageSize();
-            pageStart = Math.min(pageStart, Math.max(0, filteredRows - 1));
-            rowsInView = Math.min(
-                gridApi.paginationGetPageSize(),
-                filteredRows - pageStart
+        if (rowCountKnown && filteredRows > 0) {
+            let pageStart = 0;
+            let rowsInView = filteredRows;
+            if (${pageSize > 0 ? 'true' : 'false'} &&
+                typeof gridApi.paginationGetCurrentPage === 'function' &&
+                typeof gridApi.paginationGetPageSize === 'function') {
+                pageStart =
+                    gridApi.paginationGetCurrentPage() * gridApi.paginationGetPageSize();
+                pageStart = Math.min(pageStart, Math.max(0, filteredRows - 1));
+                rowsInView = Math.min(
+                    gridApi.paginationGetPageSize(),
+                    filteredRows - pageStart
+                );
+            }
+            const currentRow = Math.min(
+                filteredRows,
+                pageStart + Math.round(scrollRatio * Math.max(0, rowsInView - 1)) + 1
             );
+            positionEl.textContent =
+                rowNumberFormatter.format(currentRow) +
+                ' of ' + rowNumberFormatter.format(filteredRows);
+        } else {
+            const firstDisplayed = typeof gridApi.getFirstDisplayedRowIndex === 'function'
+                ? gridApi.getFirstDisplayedRowIndex() : 0;
+            positionEl.textContent =
+                rowNumberFormatter.format(Math.max(1, firstDisplayed + 1));
         }
-        const currentRow = Math.min(
-            filteredRows,
-            pageStart + Math.round(scrollRatio * Math.max(0, rowsInView - 1)) + 1
-        );
-        positionEl.textContent =
-            rowNumberFormatter.format(currentRow) +
-            ' of ' + rowNumberFormatter.format(filteredRows);
 
         const scrollbarRect = verticalScrollbar.getBoundingClientRect();
         const containerRect = containerEl.getBoundingClientRect();
@@ -1457,10 +1468,15 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
         }
 
         const columns = Array.isArray(init.columns) ? init.columns : [];
-        filteredRows = init.totalRows;
-        totalRows = init.totalRows;
+        rowCountKnown = Number.isFinite(init.totalRows);
+        if (rowCountKnown) {
+            filteredRows = init.totalRows;
+            totalRows = init.totalRows;
+        }
         const bigintFields = prepareViewerColumns(columns);
-        updateViewerRowCount(filteredRows, totalRows);
+        if (rowCountKnown) {
+            updateViewerRowCount(filteredRows, totalRows);
+        }
         const rowIndexColumn = columns.find(column => column.field === '0');
         if (rowIndexColumn) {
             rowIndexColumn.headerValueGetter = () => isFiltered
@@ -1518,15 +1534,25 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
                         finishFetch(true);
                         return;
                     }
-                    filteredRows = result.totalRows;
-                    totalRows = result.totalUnfiltered;
-                    isFiltered = Object.keys(params.filterModel || {}).length > 0;
-                    updateViewerRowCount(filteredRows, totalRows);
-                    gridApi?.refreshHeader();
+                    if (Number.isFinite(result.totalRows)) {
+                        filteredRows = result.totalRows;
+                        totalRows = Number.isFinite(result.totalUnfiltered)
+                            ? result.totalUnfiltered : result.totalRows;
+                        rowCountKnown = true;
+                    } else if (!rowCountKnown &&
+                        Number.isFinite(result.lastRow) && result.lastRow >= 0) {
+                        filteredRows = result.lastRow;
+                        totalRows = result.lastRow;
+                        rowCountKnown = true;
+                    }
+                    if (rowCountKnown) {
+                        isFiltered = Object.keys(params.filterModel || {}).length > 0;
+                        updateViewerRowCount(filteredRows, totalRows);
+                        gridApi?.refreshHeader();
+                    }
                     updateScrollPosition();
-                    const resolvedLastRow = Number.isFinite(result.totalRows) ? result.totalRows : result.lastRow;
                     const rows = prepareViewerRows(result.rows || [], bigintFields);
-                    params.successCallback(rows, resolvedLastRow);
+                    params.successCallback(rows, result.lastRow);
                     finishFetch(true);
                 } catch (e) {
                     console.error('[dataview] Failed to load page', e);

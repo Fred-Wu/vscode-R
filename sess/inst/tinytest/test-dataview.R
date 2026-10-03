@@ -748,7 +748,7 @@ if (requireNamespace("arrow", quietly = TRUE)) {
         )
         actual <- sess:::handle_dataview_page(c(list(view_id = score_view_id), params))
         expected <- sess:::handle_dataview_page(c(list(view_id = score_expected_id), params))
-        expect_equal(actual, expected)
+        expect_equal(actual$rows, expected$rows)
       }
       grouped <- dplyr::group_by(query, group)
       aggregated <- dplyr::arrange(
@@ -773,7 +773,8 @@ if (requireNamespace("arrow", quietly = TRUE)) {
             params <- c(list(startRow = start, endRow = start + 20L), model)
             actual <- sess:::handle_dataview_page(c(list(view_id = view_id), params))
             expected <- sess:::handle_dataview_page(c(list(view_id = expected_id), params))
-            expect_equal(actual, expected)
+            expect_equal(actual$rows, expected$rows)
+            expect_true(actual$lastRow %in% c(-1L, nrow(expected_df)))
           }
         }
 
@@ -781,7 +782,8 @@ if (requireNamespace("arrow", quietly = TRUE)) {
         actual <- sess:::handle_dataview_page(c(list(view_id = view_id), params))
         expected <- sess:::handle_dataview_page(c(list(view_id = expected_id), params))
         expected$rows <- expected$rows[, c("0", "2"), drop = FALSE]
-        expect_equal(actual, expected)
+        expect_equal(actual$rows, expected$rows)
+        expect_true(actual$lastRow %in% c(-1L, nrow(expected_df)))
         expect_equal(sess:::dataview_get_state(view_id)$arrow_reader$projection, 2L)
       }
     })
