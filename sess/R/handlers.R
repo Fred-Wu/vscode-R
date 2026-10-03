@@ -587,10 +587,16 @@ dataview_register <- function(data, view_id = NULL, total_rows = NULL) {
     if (!is.null(total_rows)) state$total_rows <- total_rows
     dataview_arrow_result_cache_init(state, view_id)
   }
+  if (!is.null(state$dbi) && isTRUE(state$disable_sort_filter)) {
+    dataview_dbi_result_cache_init(state, view_id)
+  }
 
   previous_state <- .sess_env$dataviews[[view_id]]
   if (!is.null(previous_state$arrow_reader)) {
     dataview_arrow_result_cache_cleanup(previous_state)
+  }
+  if (!is.null(previous_state$dbi_cache)) {
+    dataview_dbi_result_cache_cleanup(previous_state)
   }
   .sess_env$dataviews[[view_id]] <- state
   c(
@@ -1100,7 +1106,7 @@ handle_dataview_dispose <- function(params) {
       dataview_arrow_result_cache_cleanup(state)
     }
     if (!is.null(state$dbi_cache)) {
-      dataview_dbi_result_reset(state$dbi_cache)
+      dataview_dbi_result_cache_cleanup(state)
     }
     .sess_env$dataviews[[view_id]] <- NULL
   }
