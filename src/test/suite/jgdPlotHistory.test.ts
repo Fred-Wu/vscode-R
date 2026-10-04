@@ -331,6 +331,19 @@ suite('JGD PlotHistory', () => {
             assert.strictEqual(history.currentPlot()?.device.bg, 'S1-B');
             assert.strictEqual(history.count(), 2);
         });
+
+        test('switches and removes session history independently', () => {
+            history.addPlot('s1', makePlot('S1-A'));
+            history.addPlot('s2', makePlot('S2-A'));
+
+            history.setActiveSession('s1');
+            assert.strictEqual(history.currentPlot()?.device.bg, 'S1-A');
+
+            history.removeSession('s2');
+            assert.strictEqual(history.hasSession('s2'), false);
+            assert.strictEqual(history.currentPlot()?.device.bg, 'S1-A');
+            assert.strictEqual(history.count(), 1);
+        });
     });
 
     suite('events', () => {

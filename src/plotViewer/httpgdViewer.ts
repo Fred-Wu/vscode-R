@@ -26,18 +26,19 @@ export class HttpgdManager {
         };
     }
 
-    public async showViewer(urlString: string): Promise<void> {
+    public async showViewer(urlString: string, sessionId?: string): Promise<HttpgdViewer> {
         await Promise.resolve();
         const url = new URL(urlString);
         const host = url.host;
         const token = url.searchParams.get('token') || undefined;
         const ind = this.viewers.findIndex(
-            (viewer) => viewer.host === host
+            (viewer) => viewer.host === host && viewer.sessionId === sessionId
         );
         if (ind >= 0) {
             const viewer = this.viewers.splice(ind, 1)[0];
             this.viewers.unshift(viewer);
             viewer.show();
+            return viewer;
         } else {
             const conf = config();
             const colorTheme = conf.get('plot.defaults.colorTheme', 'vscode');
@@ -47,8 +48,9 @@ export class HttpgdManager {
             this.viewerOptions.resizeTimeoutLength = conf.get('plot.timing.resizeInterval', 100);
             this.viewerOptions.fullWindow = conf.get('plot.defaults.fullWindowMode', false);
             this.viewerOptions.token = token;
-            const viewer = new HttpgdViewer(host, this.viewerOptions);
+            const viewer = new HttpgdViewer(host, this.viewerOptions, sessionId);
             this.viewers.unshift(viewer);
+            return viewer;
         }
     }
 
@@ -60,15 +62,38 @@ export class HttpgdManager {
         this.recentlyActiveViewers.unshift(viewer);
     }
 
-    public getRecentViewer(): HttpgdViewer | undefined {
-        return this.recentlyActiveViewers.find((viewer) => !!viewer.webviewPanel);
+    public getRecentViewer(sessionId?: string): HttpgdViewer | undefined {
+        return this.recentlyActiveViewers.find((viewer) =>
+            !!viewer.webviewPanel && (sessionId === undefined || viewer.sessionId === sessionId)
+        );
     }
 
-    public getNewestViewer(): HttpgdViewer | undefined {
-        return this.viewers[0];
+    public getNewestViewer(sessionId?: string): HttpgdViewer | undefined {
+        return this.viewers.find(viewer => sessionId === undefined || viewer.sessionId === sessionId);
     }
 
-    public async openUrl(): Promise<void> {
+    public getViewers(sessionId?: string): HttpgdViewer[] {
+        return this.viewers.filter(viewer => sessionId === undefined || viewer.sessionId === sessionId);
+    }
+
+    public disposeSession(sessionId: string): void {
+        const disposed = this.viewers.filter(viewer => viewer.sessionId === sessionId);
+        for (const viewer of disposed) {
+            viewer.dispose();
+        }
+        this.viewers = this.viewers.filter(viewer => viewer.sessionId !== sessionId);
+        this.recentlyActiveViewers = this.recentlyActiveViewers.filter(viewer => viewer.sessionId !== sessionId);
+    }
+
+    public dispose(): void {
+        for (const viewer of this.viewers) {
+            viewer.dispose();
+        }
+        this.viewers = [];
+        this.recentlyActiveViewers = [];
+    }
+
+    public async openUrl(sessionId?: string): Promise<void> {
         const clipText = await vscode.env.clipboard.readText();
         const val0 = clipText.trim().split(/[\n ]/)[0];
         const options: vscode.InputBoxOptions = {
@@ -77,7 +102,7 @@ export class HttpgdManager {
         };
         const urlString = await vscode.window.showInputBox(options);
         if (urlString) {
-            await this.showViewer(urlString);
+            await this.showViewer(urlString, sessionId);
         }
     }
 }
@@ -106,6 +131,7 @@ export class HttpgdViewer implements IHttpgdViewer, PlotViewer {
     readonly parent: HttpgdManager;
     readonly host: string;
     readonly token?: string;
+    readonly sessionId?: string;
     webviewPanel?: vscode.WebviewPanel;
     readonly api: Httpgd;
     plots: HttpgdPlot<string>[] = [];
@@ -151,8 +177,9 @@ export class HttpgdViewer implements IHttpgdViewer, PlotViewer {
         }
     }
 
-    constructor(host: string, options: HttpgdViewerOptions) {
+    constructor(host: string, options: HttpgdViewerOptions, sessionId?: string) {
         this.host = host;
+        this.sessionId = sessionId;
         this.id = host;
         this.token = options.token;
         this.parent = options.parent;
@@ -615,6 +642,8 @@ export class HttpgdViewer implements IHttpgdViewer, PlotViewer {
     }
 
     public dispose(): void {
+        this.webviewPanel?.dispose();
+        this.webviewPanel = undefined;
         this.api.disconnect();
     }
 }

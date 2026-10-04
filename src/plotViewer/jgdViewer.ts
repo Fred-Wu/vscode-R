@@ -91,8 +91,10 @@ type WebviewMessage =
 export class JgdManager {
     public server: JgdSocketServer;
     public history: PlotHistory;
-    private viewer: JgdViewer | null = null;
+    private viewers = new Map<string, JgdViewer>();
+    private activeSessionId: string | undefined;
     private extensionUri: vscode.Uri | null = null;
+    private onViewerShown: ((sessionId: string) => void) | undefined;
     private historyChangeDisposable: { dispose(): void } | null = null;
     private started = false;
 
@@ -111,25 +113,38 @@ export class JgdManager {
             return;
         }
         this.started = true;
-        this.server.setOnFrame((_sessionId, msg: JgdMessage) => {
+        this.server.setOnFrame((sessionId, msg: JgdMessage) => {
             const current = this.history.currentPlot();
+            const viewer = this.getOrCreateViewer(sessionId);
             if (current) {
-                this.getOrCreateViewer().showPlot(current);
+                viewer.showPlot(current);
             } else if (msg.plot) {
-                this.getOrCreateViewer().showPlot(msg.plot as PlotFrame);
+                viewer.showPlot(msg.plot as PlotFrame);
+            }
+            this.onViewerShown?.(sessionId);
+            if (this.activeSessionId && this.activeSessionId !== sessionId) {
+                this.history.setActiveSession(this.activeSessionId);
             }
         });
 
-        this.server.setOnDeviceClosed((_sessionId) => {
-            this.viewer?.updateToolbar();
+        this.server.setOnDeviceClosed((sessionId) => {
+            this.viewers.get(sessionId)?.updateToolbar();
+            if (this.activeSessionId && this.activeSessionId !== sessionId) {
+                this.history.setActiveSession(this.activeSessionId);
+            }
         });
 
-        this.server.setMeasureText((request: JgdMessage) => {
-            return this.getOrCreateViewer().measureText(request as unknown as MetricsRequest);
+        this.server.setMeasureText((request: JgdMessage, sessionId) => {
+            const viewer = (sessionId ? this.viewers.get(sessionId) : undefined) ??
+                (this.activeSessionId ? this.viewers.get(this.activeSessionId) : undefined);
+            return viewer
+                ? viewer.measureText(request as unknown as MetricsRequest)
+                : Promise.resolve({ type: 'metrics_response', id: request.id ?? 0, width: 0, ascent: 0, descent: 0 });
         });
 
-        this.server.setGetDimensions(() => {
-            return this.viewer?.getPanelDimensions() ?? null;
+        this.server.setGetDimensions((sessionId) => {
+            return (sessionId ? this.viewers.get(sessionId)?.getPanelDimensions() : undefined) ??
+                (this.activeSessionId ? this.viewers.get(this.activeSessionId)?.getPanelDimensions() ?? null : null);
         });
 
         this.server.start();
@@ -146,23 +161,53 @@ export class JgdManager {
         this.started = false;
         this.server.stop();
         this.historyChangeDisposable?.dispose();
-        this.viewer?.dispose();
-        this.viewer = null;
+        for (const viewer of this.viewers.values()) {
+            viewer.dispose();
+        }
+        this.viewers.clear();
+        this.activeSessionId = undefined;
     }
 
-    getViewer(): JgdViewer | null {
-        return this.viewer;
+    setActiveSession(sessionId?: string): void {
+        this.activeSessionId = sessionId;
+        if (sessionId) {
+            this.history.setActiveSession(sessionId);
+            this.viewers.get(sessionId)?.updateToolbar();
+        }
+    }
+
+    setOnViewerShown(callback: (sessionId: string) => void): void {
+        this.onViewerShown = callback;
+    }
+
+    disposeSession(sessionId: string): void {
+        this.viewers.get(sessionId)?.dispose();
+        this.viewers.delete(sessionId);
+        this.history.removeSession(sessionId);
+        if (this.activeSessionId === sessionId) {
+            this.activeSessionId = undefined;
+        }
+    }
+
+    getViewer(sessionId = this.activeSessionId ?? this.history.getActiveSessionId()): JgdViewer | null {
+        return sessionId ? this.viewers.get(sessionId) ?? null : null;
+    }
+
+    hasSession(sessionId: string): boolean {
+        return this.history.hasSession(sessionId);
     }
 
     getEnvVars(): Record<string, string> {
         return this.server.getEnvVars();
     }
 
-    private getOrCreateViewer(): JgdViewer {
-        if (!this.viewer) {
-            this.viewer = new JgdViewer(this.extensionUri!, this.history, this.server);
+    private getOrCreateViewer(sessionId: string): JgdViewer {
+        let viewer = this.viewers.get(sessionId);
+        if (!viewer) {
+            viewer = new JgdViewer(this.extensionUri!, this.history, this.server, sessionId);
+            this.viewers.set(sessionId, viewer);
         }
-        return this.viewer;
+        return viewer;
     }
 }
 
@@ -179,9 +224,15 @@ export class JgdViewer implements PlotViewer {
         private extensionUri: vscode.Uri,
         private history: PlotHistory,
         private server: JgdSocketServer,
+        private sessionId: string,
     ) {}
 
+    private activateHistory(): void {
+        this.history.setActiveSession(this.sessionId);
+    }
+
     show(preserveFocus?: boolean): void {
+        this.activateHistory();
         if (this.panel) {
             this.panel.reveal(undefined, preserveFocus);
         } else {
@@ -197,6 +248,7 @@ export class JgdViewer implements PlotViewer {
     }
 
     async handleCommand(command: string, ...args: unknown[]): Promise<void> {
+        this.activateHistory();
         switch (command) {
             case 'nextPlot': {
                 const plot = this.history.navigateNext();
@@ -204,7 +256,7 @@ export class JgdViewer implements PlotViewer {
                     this.sendPlotToWebview(plot);
                     this.updateToolbar();
                     if (plot.device.width !== this.panelWidth || plot.device.height !== this.panelHeight) {
-                        this.server.handleResize(this.panelWidth, this.panelHeight);
+                        this.server.handleResize(this.panelWidth, this.panelHeight, this.sessionId);
                     }
                 }
                 break;
@@ -215,7 +267,7 @@ export class JgdViewer implements PlotViewer {
                     this.sendPlotToWebview(plot);
                     this.updateToolbar();
                     if (plot.device.width !== this.panelWidth || plot.device.height !== this.panelHeight) {
-                        this.server.handleResize(this.panelWidth, this.panelHeight);
+                        this.server.handleResize(this.panelWidth, this.panelHeight, this.sessionId);
                     }
                 }
                 break;
@@ -230,7 +282,7 @@ export class JgdViewer implements PlotViewer {
                 if (plot) {
                     this.sendPlotToWebview(plot);
                     this.updateToolbar();
-                    this.server.handleResize(this.panelWidth, this.panelHeight);
+                    this.server.handleResize(this.panelWidth, this.panelHeight, this.sessionId);
                 }
                 break;
             }
@@ -244,7 +296,7 @@ export class JgdViewer implements PlotViewer {
                 if (plot) {
                     this.sendPlotToWebview(plot);
                     this.updateToolbar();
-                    this.server.handleResize(this.panelWidth, this.panelHeight);
+                    this.server.handleResize(this.panelWidth, this.panelHeight, this.sessionId);
                 }
                 break;
             }
@@ -284,12 +336,14 @@ export class JgdViewer implements PlotViewer {
     }
 
     showPlot(plot: PlotFrame) {
+        this.activateHistory();
         if (!this.panel) this.createPanel(true);
         this.sendPlotToWebview(plot);
         this.updateToolbar();
     }
 
     updateToolbar() {
+        this.activateHistory();
         void this.panel?.webview.postMessage({
             type: 'toolbar',
             current: this.history.currentIndex(),
@@ -450,7 +504,7 @@ export class JgdViewer implements PlotViewer {
                 case 'resize': {
                     this.panelWidth = raw.width;
                     this.panelHeight = raw.height;
-                    this.server.handleResize(raw.width, raw.height);
+                    this.server.handleResize(raw.width, raw.height, this.sessionId);
                     break;
                 }
                 case 'navigate': {

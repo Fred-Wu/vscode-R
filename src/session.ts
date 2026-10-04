@@ -845,9 +845,9 @@ export function removeSessionFiles(): void {
     console.info('[removeSessionFiles] Done');
 }
 
-async function updatePlot() {
-    if (!globalPipePath) {return;}
-    await globalPlotManager?.showStandardPlot();
+async function updatePlot(sessionId?: string) {
+    if (!sessionId) {return;}
+    await globalPlotManager?.showStandardPlot(sessionId);
 }
 
 export function deferWorkspaceRefresh(): void {
@@ -1768,6 +1768,7 @@ export async function activateSession(session: Session): Promise<void> {
         sessionStatusBarItem.show();
     }
     await setContext('rSessionActive', true);
+    globalPlotManager?.setActiveSession(session.sessionId);
     rWorkspace?.refresh();
     scheduleWorkspaceRefresh();
 }
@@ -1918,7 +1919,7 @@ async function handleNotification(message: Record<string, unknown>, socket: IpcS
             console.info(`[startSessionWatcher] attach session ${sessionId} (${host || 'unknown'}:${rPid || 'unknown'}), terminal PID: ${terminalPid ?? 'unassociated'}`);
             purgeAddinPickerItems();
             if (params.plot_url) {
-                await globalPlotManager?.showHttpgdPlot(String(params.plot_url));
+                await globalPlotManager?.showHttpgdPlot(String(params.plot_url), socket._sessionId);
             }
             scheduleWorkspaceRefresh(0);
             break;
@@ -1936,7 +1937,7 @@ async function handleNotification(message: Record<string, unknown>, socket: IpcS
         }
         case 'httpgd': {
             if (params.url) {
-                await globalPlotManager?.showHttpgdPlot(String(params.url));
+                await globalPlotManager?.showHttpgdPlot(String(params.url), socket._sessionId);
             }
             break;
         }
@@ -1988,7 +1989,7 @@ async function handleNotification(message: Record<string, unknown>, socket: IpcS
             break;
         }
         case 'plot_updated': {
-            void updatePlot();
+            void updatePlot(socket._sessionId);
             break;
         }
         case 'restart_r': {
@@ -2101,6 +2102,7 @@ export async function cleanupSession(sessionId: string, closingSocket?: IpcSocke
         return;
     }
     sessions.delete(sessionId);
+    globalPlotManager?.disposeSession(sessionId);
     for (const [terminalPid, associated] of terminalSessions.entries()) {
         if (associated === session) {
             terminalSessions.delete(terminalPid);
@@ -2125,9 +2127,10 @@ export async function cleanupSession(sessionId: string, closingSocket?: IpcSocke
     }
 }
 
-export async function sessionRequest(data: Record<string, unknown>): Promise<unknown> {
+export async function sessionRequest(data: Record<string, unknown>, sessionId?: string | null): Promise<unknown> {
     try {
-        const socket = pipeClient;
+        // Explicitly bound viewers must never fall back to the active session.
+        const socket = sessionId === undefined ? pipeClient : sessions.get(sessionId ?? '')?.socket;
         if (!socket || socket.destroyed) {
             throw new Error('IPC socket is not connected');
         }

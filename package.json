@@ -33,7 +33,10 @@
     "workspaceContains:**/*.{rproj,Rproj,r,R,rd,Rd,rmd,Rmd}",
     "onWebviewPanel:rhelp",
     "onLanguage:r",
-    "onLanguage:rmd"
+    "onLanguage:rmd",
+    "onWebviewPanel:RPlot",
+    "onWebviewPanel:jgd.plotPane",
+    "onWebviewPanel:r.standardPlot"
   ],
   "main": "./dist/extension",
   "contributes": {

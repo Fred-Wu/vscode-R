@@ -50,30 +50,62 @@ export class CommonPlotManager implements PlotManager {
     public httpgdManager: HttpgdManager;
     public standardPlotViewer: StandardPlotViewer;
     public jgdManager: JgdManager;
+    private standardPlotViewers = new Map<string, StandardPlotViewer>();
+    private activeSessionId: string | undefined;
+    private restoredPanels = new Map<vscode.WebviewPanel, string | undefined>();
 
     constructor() {
         this.httpgdManager = new HttpgdManager();
         this.standardPlotViewer = new StandardPlotViewer();
         this.jgdManager = new JgdManager();
+        this.jgdManager.setOnViewerShown(sessionId => this.consumeRestoredPanels(sessionId));
+    }
+
+    private getStandardPlotViewer(sessionId?: string): StandardPlotViewer {
+        if (!sessionId) {
+            return this.standardPlotViewer;
+        }
+        let viewer = this.standardPlotViewers.get(sessionId);
+        if (!viewer) {
+            viewer = new StandardPlotViewer(sessionId);
+            this.standardPlotViewers.set(sessionId, viewer);
+        }
+        return viewer;
     }
 
     get viewers(): PlotViewer[] {
-        const viewers: PlotViewer[] = [...this.httpgdManager.viewers];
-        const jgdViewer = this.jgdManager.getViewer();
+        const sessionId = this.activeSessionId;
+        const viewers: PlotViewer[] = [...this.httpgdManager.getViewers(sessionId)];
+        const jgdViewer = this.jgdManager.getViewer(sessionId);
         if (jgdViewer) viewers.push(jgdViewer);
-        viewers.push(this.standardPlotViewer);
+        viewers.push(this.getStandardPlotViewer(sessionId));
         return viewers;
     }
 
     get activeViewer(): PlotViewer | undefined {
+        const sessionId = this.activeSessionId;
         if (jgdEnabled()) {
-            return this.jgdManager.getViewer() || this.httpgdManager.getRecentViewer() || this.standardPlotViewer;
+            return this.jgdManager.getViewer(sessionId) ||
+                this.httpgdManager.getRecentViewer(sessionId) ||
+                this.getStandardPlotViewer(sessionId);
         }
-        return this.httpgdManager.getRecentViewer() || this.standardPlotViewer;
+        return this.httpgdManager.getRecentViewer(sessionId) || this.getStandardPlotViewer(sessionId);
     }
 
     public initialize(): void {
         this.jgdManager.initialize(extensionContext.extensionUri);
+
+        for (const viewType of ['RPlot', 'jgd.plotPane', 'r.standardPlot']) {
+            extensionContext.subscriptions.push(
+                vscode.window.registerWebviewPanelSerializer(viewType, {
+                    deserializeWebviewPanel: async (panel) => {
+                        this.restoredPanels.set(panel, this.activeSessionId);
+                        panel.webview.html = '<!doctype html><html><body>Restoring R plot for the active session...</body></html>';
+                        panel.onDidDispose(() => this.restoredPanels.delete(panel));
+                    }
+                })
+            );
+        }
 
         for (const cmd of commands) {
             const fullCommand = `r.plot.${cmd}`;
@@ -111,12 +143,48 @@ export class CommonPlotManager implements PlotManager {
         }
     }
 
-    public async showStandardPlot(): Promise<void> {
-        await this.standardPlotViewer.update();
+    public setActiveSession(sessionId?: string): void {
+        this.activeSessionId = sessionId;
+        this.jgdManager.setActiveSession(sessionId);
+        for (const panel of this.restoredPanels.keys()) {
+            this.restoredPanels.set(panel, sessionId);
+        }
     }
 
-    public async showHttpgdPlot(url: string): Promise<void> {
-        await this.httpgdManager.showViewer(url);
+    public disposeSession(sessionId: string): void {
+        this.httpgdManager.disposeSession(sessionId);
+        this.standardPlotViewers.get(sessionId)?.dispose();
+        this.standardPlotViewers.delete(sessionId);
+        this.jgdManager.disposeSession(sessionId);
+        for (const [panel, owner] of [...this.restoredPanels]) {
+            if (owner === sessionId) {
+                this.restoredPanels.delete(panel);
+                panel.dispose();
+            }
+        }
+        if (this.activeSessionId === sessionId) {
+            this.activeSessionId = undefined;
+        }
+    }
+
+    private consumeRestoredPanels(sessionId?: string): void {
+        if (!sessionId) return;
+        for (const [panel, owner] of [...this.restoredPanels]) {
+            if (owner === sessionId) {
+                this.restoredPanels.delete(panel);
+                panel.dispose();
+            }
+        }
+    }
+
+    public async showStandardPlot(sessionId = this.activeSessionId): Promise<void> {
+        await this.getStandardPlotViewer(sessionId).update();
+        this.consumeRestoredPanels(sessionId);
+    }
+
+    public async showHttpgdPlot(url: string, sessionId = this.activeSessionId): Promise<void> {
+        await this.httpgdManager.showViewer(url, sessionId);
+        this.consumeRestoredPanels(sessionId);
     }
 
     public getJgdEnvVars(): Record<string, string> {
@@ -124,19 +192,43 @@ export class CommonPlotManager implements PlotManager {
     }
 
     public dispose(): void {
+        this.httpgdManager.dispose();
+        this.standardPlotViewer.dispose();
+        for (const viewer of this.standardPlotViewers.values()) {
+            viewer.dispose();
+        }
+        this.standardPlotViewers.clear();
         this.jgdManager.stop();
+        for (const panel of this.restoredPanels.keys()) {
+            panel.dispose();
+        }
+        this.restoredPanels.clear();
     }
 
     private async handleCommand(command: string, hostOrWebviewUri?: string | vscode.Uri, ...args: unknown[]): Promise<void> {
         if (command === 'showViewers') {
-            for (const viewer of this.viewers) {
-                viewer.show(true);
+            if (!this.activeSessionId) {
+                for (const viewer of this.viewers) {
+                    viewer.show(true);
+                }
+                return;
+            }
+            const interactive: PlotViewer[] = [...this.httpgdManager.getViewers(this.activeSessionId)];
+            const jgdViewer = this.jgdManager.getViewer(this.activeSessionId);
+            if (jgdViewer) interactive.push(jgdViewer);
+            if (interactive.length) {
+                for (const viewer of interactive) {
+                    viewer.show(true);
+                }
+                this.consumeRestoredPanels(this.activeSessionId);
+            } else {
+                await this.showStandardPlot(this.activeSessionId);
             }
             return;
         }
 
         if (command === 'openUrl') {
-            await this.httpgdManager.openUrl();
+            await this.httpgdManager.openUrl(this.activeSessionId);
             return;
         }
 

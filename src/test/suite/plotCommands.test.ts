@@ -50,6 +50,40 @@ suite('Contextual plot commands', () => {
         assert.ok(!manifest.contributes.menus.commandPalette.some(item => item.command === 'r.plot.showViewers'));
     });
 
+    test('session cleanup removes only that session plot viewers', () => {
+        const sandbox = sinon.createSandbox();
+        try {
+            mockExtensionContext(extensionRoot, sandbox);
+            const manager = new CommonPlotManager();
+            const disposeA = sandbox.stub();
+            const disposeB = sandbox.stub();
+            const viewerA = {
+                sessionId: 'session-a', dispose: disposeA, show: sandbox.stub(),
+                handleCommand: sandbox.stub(), webviewPanel: {}
+            } as unknown as HttpgdViewer;
+            const viewerB = {
+                sessionId: 'session-b', dispose: disposeB, show: sandbox.stub(),
+                handleCommand: sandbox.stub(), webviewPanel: {}
+            } as unknown as HttpgdViewer;
+            manager.httpgdManager.viewers.push(viewerA, viewerB);
+
+            manager.setActiveSession('session-a');
+            assert.ok(manager.viewers.includes(viewerA));
+            assert.ok(!manager.viewers.includes(viewerB));
+
+            manager.disposeSession('session-a');
+            sinon.assert.calledOnce(disposeA);
+            sinon.assert.notCalled(disposeB);
+            assert.ok(!manager.httpgdManager.viewers.includes(viewerA));
+            assert.ok(manager.httpgdManager.viewers.includes(viewerB));
+
+            manager.setActiveSession('session-b');
+            assert.ok(manager.viewers.includes(viewerB));
+        } finally {
+            sandbox.restore();
+        }
+    });
+
     test('plot commands remain registered and route to the appropriate viewers', () => {
         const sandbox = sinon.createSandbox();
         try {

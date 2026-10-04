@@ -33,16 +33,17 @@ interface RSession {
     lastResizeW: number;
     lastResizeH: number;
     lastResizeHadPlotIndex: boolean;
+    historySessionId: string;
 }
 
 const isWindows = process.platform === 'win32';
 
 export interface JgdMeasureText {
-    (request: JgdMessage): Promise<unknown>;
+    (request: JgdMessage, sessionId?: string): Promise<unknown>;
 }
 
 export interface JgdGetDimensions {
-    (): { width: number; height: number } | null;
+    (sessionId?: string): { width: number; height: number } | null;
 }
 
 export class JgdSocketServer {
@@ -98,19 +99,21 @@ export class JgdSocketServer {
         this.onDeviceClosedFn = fn;
     }
 
-    handleResize(w: number, h: number) {
+    handleResize(w: number, h: number, sessionId?: string) {
+        if (sessionId) {
+            this.history.setActiveSession(sessionId);
+        }
         const idx = this.history.currentIndex();
         const total = this.history.count();
         if ((total > 0 && idx < total) || (total > 0 && this.history.isLatestDeleted())) {
             const rIndex = this.history.currentRIndex();
             if (rIndex !== undefined) {
-                const sessionId = this.history.getActiveSessionId();
-                this.broadcastResize(w, h, rIndex, sessionId);
+                this.broadcastResize(w, h, rIndex, this.history.getActiveSessionId());
             } else {
-                this.broadcastResize(w, h);
+                this.broadcastResize(w, h, undefined, sessionId);
             }
         } else {
-            this.broadcastResize(w, h);
+            this.broadcastResize(w, h, undefined, sessionId);
         }
     }
 
@@ -173,7 +176,8 @@ export class JgdSocketServer {
         const sessionId = `session-${++this.sessionCounter}`;
         const session: RSession = {
             id: sessionId, socket, buffer: '', welcomeSent: false,
-            lastResizeW: 0, lastResizeH: 0, lastResizeHadPlotIndex: false
+            lastResizeW: 0, lastResizeH: 0, lastResizeHadPlotIndex: false,
+            historySessionId: sessionId
         };
         this.sessions.set(sessionId, session);
         this.notifyConnectionChange();
@@ -196,7 +200,7 @@ export class JgdSocketServer {
                     };
                     socket.write(JSON.stringify(welcome) + '\n');
 
-                    const dims = this.getDimensionsFn?.();
+                    const dims = this.getDimensionsFn?.(session.historySessionId);
                     if (dims) {
                         session.lastResizeW = dims.width;
                         session.lastResizeH = dims.height;
@@ -227,7 +231,13 @@ export class JgdSocketServer {
                 case 'frame': {
                     const plot = msg.plot;
                     if (plot) {
-                        plot.sessionId = session.id;
+                        const vscodeSessionId = typeof msg.ext?.vscodeSessionId === 'string'
+                            ? msg.ext.vscodeSessionId.trim() : '';
+                        if (vscodeSessionId) {
+                            session.historySessionId = vscodeSessionId;
+                        }
+                        const historySessionId = session.historySessionId;
+                        plot.sessionId = historySessionId;
                         plot.frameExt = msg.ext ?? null;
 
                         const isResizeReplay = !!msg.resizeReplay;
@@ -235,22 +245,22 @@ export class JgdSocketServer {
 
                         let accepted = true;
                         if (isResizeReplay && plotIndex !== undefined) {
-                            accepted = this.history.replaceAtIndex(session.id, plotIndex, plot as PlotFrame);
+                            accepted = this.history.replaceAtIndex(historySessionId, plotIndex, plot as PlotFrame);
                         } else if (isResizeReplay) {
                             const plotNumber = (typeof msg.plotNumber === 'number' && Number.isFinite(msg.plotNumber)) ? msg.plotNumber : undefined;
-                            accepted = this.history.replaceLatest(session.id, plot as PlotFrame, plotNumber);
+                            accepted = this.history.replaceLatest(historySessionId, plot as PlotFrame, plotNumber);
                         } else if (msg.incremental) {
-                            accepted = this.history.appendOps(session.id, plot as PlotFrame);
+                            accepted = this.history.appendOps(historySessionId, plot as PlotFrame);
                         } else if (msg.newPage) {
                             if (typeof msg.plotNumber === 'number' && Number.isFinite(msg.plotNumber)) {
                                 plot.rIndex = msg.plotNumber;
                             }
-                            this.history.addPlot(session.id, plot as PlotFrame);
+                            this.history.addPlot(historySessionId, plot as PlotFrame);
                         } else {
-                            this.history.replaceLatest(session.id, plot as PlotFrame);
+                            this.history.replaceLatest(historySessionId, plot as PlotFrame);
                         }
                         if (accepted) {
-                            this.onFrameFn?.(session.id, msg);
+                            this.onFrameFn?.(historySessionId, msg);
                         }
                     }
                     break;
@@ -258,7 +268,7 @@ export class JgdSocketServer {
 
                 case 'metrics_request':
                     if (this.measureTextFn) {
-                        void this.measureTextFn(msg).then((response: unknown) => {
+                        void this.measureTextFn(msg, session.historySessionId).then((response: unknown) => {
                             const resp = JSON.stringify(response) + '\n';
                             session.socket.write(resp);
                         });
@@ -267,7 +277,7 @@ export class JgdSocketServer {
 
                 case 'close':
                     console.log(`jgd: session ${session.id} device closed`);
-                    this.onDeviceClosedFn?.(session.id);
+                    this.onDeviceClosedFn?.(session.historySessionId);
                     break;
 
                 default:
@@ -278,22 +288,34 @@ export class JgdSocketServer {
         }
     }
 
+    private findSession(sessionId: string): RSession | undefined {
+        return this.sessions.get(sessionId) ??
+            [...this.sessions.values()].find(session => session.historySessionId === sessionId);
+    }
+
     sendToSession(sessionId: string, msg: object) {
-        const session = this.sessions.get(sessionId);
+        const session = this.findSession(sessionId);
         if (session) {
             session.socket.write(JSON.stringify(msg) + '\n');
         }
     }
 
     private broadcastResize(w: number, h: number, plotIndex?: number, sessionId?: string) {
-        if (plotIndex !== undefined) {
-            if (!sessionId) return;
-            const session = this.sessions.get(sessionId);
+        if (sessionId) {
+            const session = this.findSession(sessionId);
             if (!session) return;
+            if (plotIndex === undefined &&
+                session.lastResizeW === w && session.lastResizeH === h &&
+                !session.lastResizeHadPlotIndex) {
+                return;
+            }
             session.lastResizeW = w;
             session.lastResizeH = h;
-            session.lastResizeHadPlotIndex = true;
-            const data = JSON.stringify({ type: 'resize', width: w, height: h, plotIndex }) + '\n';
+            session.lastResizeHadPlotIndex = plotIndex !== undefined;
+            const data = JSON.stringify({
+                type: 'resize', width: w, height: h,
+                ...(plotIndex !== undefined ? { plotIndex } : {})
+            }) + '\n';
             session.socket.write(data);
             return;
         }

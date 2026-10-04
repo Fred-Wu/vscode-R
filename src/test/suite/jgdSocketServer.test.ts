@@ -159,6 +159,18 @@ suite('JGD SocketServer', () => {
             assert.strictEqual(shownPlots.length, 1);
         });
 
+        test('uses stable vscode session id from frame extensions', async () => {
+            const client = await connect();
+
+            client.send(makePlotMsg('A', 400, 300, {
+                ext: { vscodeSessionId: 'vscode-session-a' }
+            }));
+            await waitMs(50);
+
+            assert.strictEqual(history.getActiveSessionId(), 'vscode-session-a');
+            assert.strictEqual(history.currentPlot()?.sessionId, 'vscode-session-a');
+        });
+
         test('routes incremental frame via appendOps', async () => {
             const client = await connect();
 
@@ -221,6 +233,23 @@ suite('JGD SocketServer', () => {
 
             assert.strictEqual(history.count(), 1);
             assert.strictEqual(history.currentPlot()?.device.bg, 'RED-resized');
+        });
+    });
+
+    suite('session-aware resize', () => {
+        test('targets only the viewer session that resized', async () => {
+            const a = await connect();
+            const b = await connect();
+
+            a.send(makePlotMsg('A', 400, 300, { ext: { vscodeSessionId: 'vscode-a' } }));
+            b.send(makePlotMsg('B', 400, 300, { ext: { vscodeSessionId: 'vscode-b' } }));
+            await waitMs(50);
+
+            server.handleResize(900, 700, 'vscode-a');
+            const resize = JSON.parse(await a.readLine()) as { type: string; width: number; height: number };
+            assert.strictEqual(resize.type, 'resize');
+            assert.strictEqual(resize.width, 900);
+            assert.strictEqual(resize.height, 700);
         });
     });
 

@@ -146,6 +146,27 @@ export class PlotHistory {
         return this.activeSessionId;
     }
 
+    setActiveSession(sessionId: string): void {
+        if (this.activeSessionId !== sessionId) {
+            this.activeSessionId = sessionId;
+            this.emitter.emit('change');
+        }
+    }
+
+    hasSession(sessionId: string): boolean {
+        return this.sessions.has(sessionId);
+    }
+
+    removeSession(sessionId: string): void {
+        const removed = this.sessions.delete(sessionId);
+        if (this.activeSessionId === sessionId) {
+            this.activeSessionId = '';
+        }
+        if (removed) {
+            this.emitter.emit('change');
+        }
+    }
+
     currentIndex(): number {
         const session = this.sessions.get(this.activeSessionId);
         return session ? session.currentIndex + 1 : 0;

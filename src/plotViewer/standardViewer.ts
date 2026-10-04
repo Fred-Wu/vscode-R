@@ -1,7 +1,7 @@
 
 import * as vscode from 'vscode';
 import { asViewColumn, config, UriIcon } from '../util';
-import { sessionRequest, globalPipePath } from '../session';
+import { sessionRequest } from '../session';
 import { PlotViewer } from './types';
 
 interface PlotResponse {
@@ -16,6 +16,8 @@ export class StandardPlotViewer implements PlotViewer {
     private viewHeight: number = 600;
     private plotData: string | undefined;
     private plotFormat: string | undefined;
+
+    constructor(private readonly sessionId?: string) {}
 
     public async update(): Promise<void> {
         const viewColumn = asViewColumn(config().get<string>('session.viewers.viewColumn.plot'), vscode.ViewColumn.Two);
@@ -72,7 +74,7 @@ export class StandardPlotViewer implements PlotViewer {
     }
 
     private async requestPlot() {
-        if (!globalPipePath || !this.panel) {
+        if (!this.panel) {
             return;
         }
 
@@ -86,7 +88,7 @@ export class StandardPlotViewer implements PlotViewer {
                 format: format,
                 devArgs: devArgs
             }
-        }) as PlotResponse | undefined;
+        }, this.sessionId) as PlotResponse | undefined;
 
         if (response?.data) {
             this.plotData = response.data;

@@ -171,9 +171,23 @@ runtime_start <- function(use_rstudioapi = TRUE, use_httpgd = TRUE, use_jgd = FA
   # 4. Plot device: JGD > httpgd > Standard
   .sess_env$runtime_start_phase <- "plot"
   if (use_jgd && nzchar(Sys.getenv("JGD_SOCKET")) && requireNamespace("jgd", quietly = TRUE)) {
+    set_jgd_session <- function() {
+      if (exists("jgd_frame_ext", envir = asNamespace("jgd"), inherits = FALSE)) {
+        tryCatch(
+          jgd::jgd_frame_ext(jsonlite::toJSON(
+            list(vscodeSessionId = .session_id()),
+            auto_unbox = TRUE
+          )),
+          error = function(e) NULL
+        )
+      }
+      invisible(NULL)
+    }
+
     .runtime_set_option("device", function(...) {
       jgd::jgd()
       .runtime_track_device()
+      set_jgd_session()
     })
 
     # On reattach (e.g. after a VS Code window reload) the renderer starts a new
@@ -190,7 +204,10 @@ runtime_start <- function(use_rstudioapi = TRUE, use_httpgd = TRUE, use_jgd = FA
       recorded <- tryCatch(grDevices::recordPlot(), error = function(e) NULL)
       tryCatch(grDevices::dev.off(), error = function(e) NULL)
       before_reopen <- grDevices::dev.list()
-      tryCatch(jgd::jgd(), error = function(e) NULL)
+      tryCatch({
+        jgd::jgd()
+        set_jgd_session()
+      }, error = function(e) NULL)
       after_reopen <- grDevices::dev.list()
       if (!is.null(after_reopen)) {
         opened <- if (is.null(before_reopen)) after_reopen else setdiff(after_reopen, before_reopen)

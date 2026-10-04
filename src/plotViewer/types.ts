@@ -10,6 +10,8 @@ export interface PlotManager {
     viewers: PlotViewer[];
     activeViewer: PlotViewer | undefined;
     initialize(): void;
-    showStandardPlot(): Promise<void>;
-    showHttpgdPlot(url: string): Promise<void>;
+    setActiveSession(sessionId?: string): void;
+    disposeSession(sessionId: string): void;
+    showStandardPlot(sessionId?: string): Promise<void>;
+    showHttpgdPlot(url: string, sessionId?: string): Promise<void>;
 }
