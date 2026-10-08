@@ -11,15 +11,20 @@ import { commands, Uri, ViewColumn, Webview, window, env } from 'vscode';
 import { restartRTerminal } from './rTerminal';
 import { config, readContent, setContext, UriIcon } from './util';
 import * as rTerminal from './rTerminal';
+import { getProcessAncestors } from './processTree';
+import { TerminalSessionRegistry } from './terminalSessionRegistry';
+import { SessionProcessMonitor } from './sessionProcessMonitor';
 import { purgeAddinPickerItems, RSEditOperation, RSRange } from './rstudioapi';
 
 import { extensionContext, rWorkspace, globalRHelp, globalPlotManager, sessionStatusBarItem, enableSessionWatcher } from './extension';
 import { resolveBackend, jgdEnabled, CommonPlotManager } from './plotViewer';
-import type { RSessionConnectionInfo } from './api';
+import type { RSessionActivationOptions, RSessionConnectionInfo } from './api';
 
 import { showWebView } from './webViewer';
+import { getListViewerScript, listViewerStyle, ListViewNavigation } from './listViewer';
 import { getDataViewerScript, getDataViewerStyle, getDataViewerToolbarHtml } from './dataViewer';
 import { getDataViewerColumnPanelHtml, getDataViewerColumnPanelScript, getDataViewerColumnPanelStyle } from './dataViewerColumnPanel';
+import { formatSessionLabel, getViewerSessionScript } from './viewerSession';
 
 export interface SessionInfo {
     version: string;
@@ -55,6 +60,18 @@ interface IpcSocket extends net.Socket {
 
 export class Session {
     public busyDataView: string | undefined;
+    private exited = false;
+    public get processExited(): boolean { return this.exited; }
+    public set processExited(value: boolean) {
+        this.exited = value;
+        if (value) { sessionProcessMonitor.markExited(this); }
+    }
+    public label?: string;
+    public workspaceUnavailable?: string;
+    public execute?: (code: string) => Promise<void>;
+    public rPath?: string;
+    public libraryPaths?: string[];
+    public requester?: (data: Record<string, unknown>) => Promise<unknown>;
     public sessionId: string;
     public host: string;
     public sessVersion: string;
@@ -94,11 +111,132 @@ let info: SessionInfo;
 export let globalPipePath: string | undefined;
 export let workspaceFile: string;
 
-const SESS_PROTOCOL_VERSION = 1;
+const SESS_PROTOCOL_VERSION = 2;
 
 const sessions = new Map<string, Session>();
-const terminalSessions = new Map<string, Session>();
+const sessionProcessMonitor = new SessionProcessMonitor<Session>(isLocalHost);
+// Only the newest handshake for a stable ID may commit after terminal discovery.
+const pendingSessionAttachments = new Map<string, IpcSocket>();
+const terminalRegistry = new TerminalSessionRegistry<Session, vscode.Terminal>(
+    target => sessions.get(target.sessionId) === target && isConnectedSession(target),
+    terminal => !terminal.exitStatus && window.terminals.includes(terminal),
+);
+const documentSessions = new Map<string, Session>();
+const sessionDocumentBound = new vscode.EventEmitter<Uri>();
+export const onDidBindSessionDocument = sessionDocumentBound.event;
+
+export function sessionForDocument(uri: Uri): Session | undefined {
+    return boundSessionForDocument(uri) ?? activeSession;
+}
+
+export function boundSessionForDocument(uri: Uri): Session | undefined {
+    return documentSessions.get(uri.toString()) ?? (uri.scheme === 'vscode-notebook-cell'
+        ? documentSessions.get(Uri.from({ scheme: uri.scheme, path: uri.path }).toString()) : undefined);
+}
+
+export function bindSessionDocument(uri: Uri, session: Session): void {
+    const previous = boundSessionForDocument(uri);
+    documentSessions.set(uri.toString(), session);
+    if (previous !== session) { sessionDocumentBound.fire(uri); }
+}
+
+export function unbindSessionDocument(uri: Uri): void { documentSessions.delete(uri.toString()); }
+
+export function unregisterSessionTransport(target: Session): void {
+    for (const [uri, owner] of documentSessions) { if (owner === target) { documentSessions.delete(uri); } }
+    terminalRegistry.releaseSession(target);
+    if (sessions.get(target.sessionId) === target) { sessions.delete(target.sessionId); }
+    if (activeSession === target) { void clearActiveSession(); }
+}
+
+function clearActiveSession(): Promise<void> {
+    sessionSelectionRevision++;
+    deferWorkspaceRefresh();
+    workspaceRefreshPending = false;
+    activeSession = undefined;
+    workspaceData = { search: [], loaded_namespaces: [], globalenv: {} };
+    workingDir = '';
+    resetStatusBar();
+    rWorkspace?.refresh();
+    return setContext('rSessionActive', false);
+}
+
+function isConnectedSession(target: Session): boolean {
+    return Boolean(target.requester) || (isCurrentSocket(target.socket) && !target.socket.destroyed && target.socket.writable);
+}
+
+function assertExecutableSession(target: Session): void {
+    if (sessions.get(target.sessionId) !== target || !isConnectedSession(target) || target.workspaceUnavailable) {
+        throw new Error(target.workspaceUnavailable ?? 'This R session is no longer attached. Select an attached session in the Workspace viewer.');
+    }
+}
+
+/** Workspace actions must use the process represented by the tree, even after focus changes. */
+export async function executeSessionCode(target: Session, code: string): Promise<void> {
+    assertExecutableSession(target);
+    if (target.execute) { await target.execute(code); return; }
+    const association = terminalRegistry.forSession(target);
+    if (association) {
+        await rTerminal.runTextInTerminal(association.terminal, code, true, () => {
+            assertExecutableSession(target);
+            if (!terminalRegistry.isCurrent(association)) {
+                throw new Error('This R session no longer owns its attached terminal. Activate it with its terminal again.');
+            }
+        });
+        return;
+    }
+    throw new Error('This R session has no attached terminal. Attach its terminal or open it in an Interactive window.');
+}
+
+export function updateSessionWorkspace(target: Session, data: WorkspaceData): void {
+    target.workspaceData = data;
+    if (activeSession === target) {
+        void refreshActiveSession(target);
+    }
+}
+
+/** Move document routing to a new process; existing data viewers keep their old owner. */
+export function replaceSessionTransport(previous: Session, next: Session): void {
+    for (const [uri, owner] of documentSessions) { if (owner === previous) { documentSessions.set(uri, next); } }
+    terminalRegistry.releaseSession(previous);
+    if (sessions.get(previous.sessionId) === previous) { sessions.delete(previous.sessionId); }
+    if (activeSession === previous) { sessionSelectionRevision++; activeSession = next; }
+}
+
+export function registerSessionTransport(id: string, host: string, directory: string,
+    requester: (data: Record<string, unknown>) => Promise<unknown>): Session {
+    const target = sessions.get(id) ?? new Session(id, host, '', '', new net.Socket());
+    target.requester = requester;
+    target.workingDir = directory;
+    sessions.set(id, target);
+    return target;
+}
+/** Wait for the same connected owner used by execution and terminal selection. */
+export function waitForTerminalReady(terminal: vscode.Terminal, timeout = 30000): Promise<boolean> {
+    return new Promise(resolve => {
+        let settled = false;
+        const finish = (ready: boolean) => {
+            if (settled) { return; }
+            settled = true;
+            clearTimeout(timer);
+            attached.dispose();
+            closed.dispose();
+            resolve(ready);
+        };
+        const check = () => {
+            if (terminalRegistry.isClosed(terminal) || terminal.exitStatus) { finish(false); }
+            else if (terminalRegistry.ownerOf(terminal)) { finish(true); }
+        };
+        const attached = terminalRegistry.onDidChange(changed => { if (changed === terminal) { check(); } });
+        const closed = window.onDidCloseTerminal(changed => { if (changed === terminal) { finish(false); } });
+        // A timeout rejects startup; it never authorizes sending input.
+        const timer = setTimeout(() => finish(false), timeout);
+        check();
+    });
+}
 export let activeSession: Session | undefined;
+// Older terminal lookups must not overwrite a newer selection or activation.
+let sessionSelectionRevision = 0;
 let activeBrowserUri: Uri | undefined;
 let workspaceRefreshTimer: NodeJS.Timeout | undefined;
 let workspaceRefreshInProgress = false;
@@ -119,6 +257,7 @@ interface DataViewInitResult {
     columns: DataViewColumnDef[];
     totalRows?: number;
     columnProjection?: boolean;
+    live?: boolean;
 }
 
 interface DataViewPageResult {
@@ -132,6 +271,7 @@ interface DataViewRequestMessage {
     message: 'dataview/request';
     action: 'init' | 'page';
     requestId: number;
+    documentGeneration: number;
     startRow?: number;
     endRow?: number;
     sortModel?: unknown[];
@@ -140,8 +280,9 @@ interface DataViewRequestMessage {
 }
 
 const dynamicDataViewPanels = new Map<string, vscode.WebviewPanel>();
-const dynamicDataViewSessions = new WeakMap<vscode.WebviewPanel, Session>();
-let dynamicDataViewReloadRevision = 0;
+const dynamicDataViewStateGenerations = new WeakMap<vscode.WebviewPanel, number>();
+const documentGenerations = new WeakMap<Webview, number>();
+let documentGenerationRevision = 0;
 
 function escapeHtml(text: string): string {
     const map: Record<string, string> = {
@@ -154,16 +295,49 @@ function escapeHtml(text: string): string {
     return text.replace(/[&<>"']/g, c => map[c]);
 }
 
-function attachDynamicDataViewBridge(panel: vscode.WebviewPanel, viewId: string, baseTitle: string, dataViewSession: Session): void {
-    const panelKey = `${dataViewSession.sessionId}:${viewId}`;
-    let disposed = false;
-    let pageQueue = Promise.resolve();
-    const postResponse = (requestId: number, ok: boolean, result?: unknown, error?: string) => {
-        if (disposed) {
+function registerDataViewPanel(
+    panel: vscode.WebviewPanel, key: string, viewId: string, sessionId: string | null,
+    stateGeneration?: number,
+): void {
+    // The panel's webview getter throws once onDidDispose fires.
+    const webview = panel.webview;
+    dynamicDataViewPanels.set(key, panel);
+    if (stateGeneration !== undefined) {
+        dynamicDataViewStateGenerations.set(panel, stateGeneration);
+    }
+    panel.onDidDispose(() => {
+        documentGenerations.delete(webview);
+        const currentStateGeneration = dynamicDataViewStateGenerations.get(panel);
+        dynamicDataViewStateGenerations.delete(panel);
+        if (dynamicDataViewPanels.get(key) !== panel) {
             return;
         }
-        void panel.webview.postMessage({
+        dynamicDataViewPanels.delete(key);
+        const owner = sessions.get(sessionId ?? '');
+        if (owner) { void interruptDataView(owner, viewId); }
+        // Interactive transcripts retain this handle after the expanded viewer closes.
+        if (currentStateGeneration === undefined && sessions.get(sessionId ?? '')?.requester) { return; }
+        void sessionRequest({
+            method: 'dataview_dispose',
+            params: { view_id: viewId, state_generation: currentStateGeneration },
+        }, sessionId);
+    });
+}
+
+function attachDynamicDataViewBridge(panel: vscode.WebviewPanel, viewId: string, sessionId: string | null): void {
+    const webview = panel.webview;
+    let disposed = false;
+    let pageQueue = Promise.resolve();
+    panel.onDidDispose(() => { disposed = true; });
+    const postResponse = (
+        documentGeneration: number, requestId: number, ok: boolean, result?: unknown, error?: string
+    ) => {
+        if (disposed || documentGeneration !== documentGenerations.get(webview)) {
+            return;
+        }
+        void webview.postMessage({
             message: 'dataview/response',
+            documentGeneration,
             requestId,
             ok,
             result,
@@ -171,9 +345,11 @@ function attachDynamicDataViewBridge(panel: vscode.WebviewPanel, viewId: string,
         });
     };
 
-    panel.webview.onDidReceiveMessage(async (raw: unknown) => {
+    webview.onDidReceiveMessage(async (raw: unknown) => {
         const msg = raw as Partial<DataViewRequestMessage>;
-        if (msg.message !== 'dataview/request' || typeof msg.requestId !== 'number') {
+        if (msg.message !== 'dataview/request' || typeof msg.requestId !== 'number' ||
+            typeof msg.documentGeneration !== 'number' ||
+            msg.documentGeneration !== documentGenerations.get(webview)) {
             return;
         }
         if (disposed) {
@@ -185,7 +361,7 @@ function attachDynamicDataViewBridge(panel: vscode.WebviewPanel, viewId: string,
                 const result = await sessionRequest({
                     method: 'dataview_init',
                     params: { view_id: viewId },
-                }, 5000, dataViewSession.socket) as DataViewInitResult | undefined;
+                }, sessionId) as DataViewInitResult | undefined;
                 if (disposed) {
                     return;
                 }
@@ -193,8 +369,7 @@ function attachDynamicDataViewBridge(panel: vscode.WebviewPanel, viewId: string,
                     (result.totalRows !== undefined && typeof result.totalRows !== 'number')) {
                     throw new Error('Invalid dataview_init response');
                 }
-                panel.title = baseTitle;
-                postResponse(msg.requestId, true, result);
+                postResponse(msg.documentGeneration, msg.requestId, true, result);
                 return;
             }
 
@@ -206,7 +381,7 @@ function attachDynamicDataViewBridge(panel: vscode.WebviewPanel, viewId: string,
                 pageQueue = new Promise<void>(resolve => { release = resolve; });
                 try {
                     await previous;
-                    if (disposed) {
+                    if (disposed || msg.documentGeneration !== documentGenerations.get(webview)) {
                         return;
                     }
                     const result = await sessionRequest({
@@ -220,7 +395,7 @@ function attachDynamicDataViewBridge(panel: vscode.WebviewPanel, viewId: string,
                             fields: Array.isArray(msg.fields) ? msg.fields : undefined,
                             notify_busy: true,
                         },
-                    }, 0, dataViewSession.socket) as DataViewPageResult | undefined;
+                    }, sessionId, 0) as DataViewPageResult | undefined;
                     if (!result || !Array.isArray(result.rows) ||
                         typeof result.lastRow !== 'number' ||
                         (result.totalRows !== undefined && typeof result.totalRows !== 'number') ||
@@ -228,34 +403,20 @@ function attachDynamicDataViewBridge(panel: vscode.WebviewPanel, viewId: string,
                             typeof result.totalUnfiltered !== 'number')) {
                         throw new Error('Invalid dataview_page response');
                     }
-                    if (disposed) {
+                    if (disposed || msg.documentGeneration !== documentGenerations.get(webview)) {
                         return;
                     }
-                    panel.title = baseTitle;
-                    postResponse(msg.requestId, true, result);
+                    postResponse(msg.documentGeneration, msg.requestId, true, result);
                 } finally {
                     release();
                 }
                 return;
             }
 
-            postResponse(msg.requestId, false, undefined, `Unsupported dataview action: ${String(msg.action)}`);
+            postResponse(msg.documentGeneration, msg.requestId, false, undefined, `Unsupported dataview action: ${String(msg.action)}`);
         } catch (e) {
-            postResponse(msg.requestId, false, undefined, e instanceof Error ? e.message : String(e));
+            postResponse(msg.documentGeneration, msg.requestId, false, undefined, e instanceof Error ? e.message : String(e));
         }
-    });
-
-    panel.onDidDispose(() => {
-        disposed = true;
-        if (dynamicDataViewPanels.get(panelKey) !== panel) {
-            return;
-        }
-        dynamicDataViewPanels.delete(panelKey);
-        void interruptDataView(dataViewSession, viewId);
-        void sessionRequest({
-            method: 'dataview_dispose',
-            params: { view_id: viewId },
-        }, 0, dataViewSession.socket);
     });
 }
 
@@ -270,7 +431,7 @@ async function interruptDataView(session: Session, viewId: string): Promise<void
             return;
         }
         if (terminalPid !== undefined &&
-            (terminalSessions.get(String(terminalPid)) === session || String(terminalPid) === session.pid)) {
+            (terminalRegistry.ownerOf(terminal) === session || String(terminalPid) === session.pid)) {
             terminal.sendText('\x03', false);
             return;
         }
@@ -302,7 +463,6 @@ const pendingRequests = new Map<number, {
     socket: IpcSocket;
 }>();
 
-const closedTerminals = new WeakSet<vscode.Terminal>();
 const terminalDiscoveryOperations = new WeakMap<vscode.Terminal, Promise<void>>();
 
 function queueTerminalDiscoveryOperation(terminal: vscode.Terminal, operation: () => Promise<void>): Promise<void> {
@@ -352,7 +512,16 @@ function terminalDiscoveryPath(terminal: vscode.Terminal): string | undefined {
 }
 
 export function isTerminalClosed(terminal: vscode.Terminal): boolean {
-    return closedTerminals.has(terminal);
+    return terminalRegistry.isClosed(terminal);
+}
+
+function isLiveTerminal(terminal: vscode.Terminal): boolean {
+    return terminalRegistry.isLive(terminal);
+}
+
+/** Called for every terminal close, including extension-owned pseudoterminals. */
+export function cleanupTerminalBinding(terminal: vscode.Terminal): void {
+    terminalRegistry.closeTerminal(terminal);
 }
 
 /**
@@ -361,7 +530,7 @@ export function isTerminalClosed(terminal: vscode.Terminal): boolean {
  * VS Code also closes terminals while preserving them for a window reload.
  */
 export async function removeTerminalDiscoveryFile(terminal: vscode.Terminal): Promise<void> {
-    closedTerminals.add(terminal);
+    terminalRegistry.closeTerminal(terminal);
 
     await queueTerminalDiscoveryOperation(terminal, async () => {
         let discoveryPath = terminalDiscoveryPath(terminal);
@@ -622,6 +791,9 @@ function startGlobalSessionServer(): Promise<string> {
                 readBuffers = [];
                 readBufferLength = 0;
                 activeConnections.delete(socket);
+                for (const [id, pending] of pendingSessionAttachments) {
+                    if (pending === socket) { pendingSessionAttachments.delete(id); }
+                }
                 for (const [id, pending] of pendingRequests.entries()) {
                     if (pending.socket === socket) {
                         pendingRequests.delete(id);
@@ -719,20 +891,17 @@ function getAttachSessionScriptPath(pipePath: string): string {
 
 function buildAttachSessionScript(pipePath: string, sessPath: string, installSessScriptPath: string): string {
     const backend = resolveBackend();
-    const useHttpgd = backend === 'httpgd' || backend === 'auto' ? 'TRUE' : 'FALSE';
-    const jgd = jgdEnabled(backend);
-    const useJgd = jgd ? 'TRUE' : 'FALSE';
     const jgdSocket = getSessionJgdSocket();
     return [
         'local({',
         `  endpoint <- ${asRStringLiteral(pipePath)}`,
         `  sess_src <- ${asRStringLiteral(sessPath)}`,
         `  install_sess_script <- ${asRStringLiteral(installSessScriptPath)}`,
-        jgdSocket ? `  Sys.setenv(JGD_SOCKET = ${asRStringLiteral(jgdSocket)})` : '  Sys.unsetenv("JGD_SOCKET")',
-        '  bundled_version <- tryCatch(read.dcf(file.path(sess_src, "DESCRIPTION"))[1, "Version"], error = function(e) NA_character_)',
-        '  installed_version <- suppressWarnings(tryCatch(as.character(utils::packageVersion("sess")), error = function(e) NA_character_))',
-        '  needs_install <- is.na(installed_version) || (!is.na(bundled_version) && utils::compareVersion(installed_version, bundled_version) < 0)',
-        '  if (needs_install) {',
+        ...(backend === 'native' ? [] : [
+            jgdSocket ? `  Sys.setenv(JGD_SOCKET = ${asRStringLiteral(jgdSocket)})` : '  Sys.unsetenv("JGD_SOCKET")',
+        ]),
+        `  source(${asRStringLiteral(extensionContext.asAbsolutePath(path.join('R', 'sess_source.R')).replace(/\\/g, '/'))}, local = TRUE)`,
+        '  if (sess_install_required(sess_src)) {',
         '    if (!file.exists(install_sess_script)) {',
         '      stop(sprintf("install_sess.R not found: %s", install_sess_script))',
         '    }',
@@ -740,7 +909,7 @@ function buildAttachSessionScript(pipePath: string, sessPath: string, installSes
         '    on.exit(Sys.unsetenv(c("VSCODE_R_SESS_PKG_PATH", "VSCODE_R_SESS_REPO")), add = TRUE)',
         '    source(install_sess_script, local = TRUE)',
         '  }',
-        `  sess::connect(endpoint = endpoint, use_httpgd = ${useHttpgd}, use_jgd = ${useJgd})`,
+        `  sess::connect(endpoint = endpoint, plot_backend = ${asRStringLiteral(backend)})`,
         '})',
         '',
     ].join('\n');
@@ -748,7 +917,7 @@ function buildAttachSessionScript(pipePath: string, sessPath: string, installSes
 
 export async function getAttachSessionCommand(): Promise<string> {
     const pipePath = await getGlobalPipePath();
-    const sessPath = extensionContext.asAbsolutePath('sess').replace(/\\/g, '/');
+    const sessPath = extensionContext.asAbsolutePath(path.join('dist', 'resources', 'sess')).replace(/\\/g, '/');
     const installSessScriptPath = extensionContext.asAbsolutePath(path.join('R', 'install_sess.R')).replace(/\\/g, '/');
     const scriptPath = getAttachSessionScriptPath(pipePath);
     await fs.ensureDir(path.dirname(scriptPath));
@@ -779,6 +948,7 @@ export async function shutdownSessionWatcher(): Promise<void> {
         socket.destroy();
     }
     activeConnections.clear();
+    pendingSessionAttachments.clear();
     pipeClient = undefined;
 
     if (globalSessionServer) {
@@ -806,72 +976,68 @@ export async function shutdownSessionWatcher(): Promise<void> {
 }
 
 export async function activateRSession(): Promise<void> {
-    if (config().get<boolean>('sessionWatcher')) {
-        console.info('[activateRSession]');
-        const terminal = window.activeTerminal;
-        const pidArg = await terminal?.processId;
-        if (terminal) {
-            if (pidArg) {
-                const session = terminalSessions.get(String(pidArg));
-                if (session) {
-                    console.info(`[activateRSession] Found existing session for PID: ${pidArg}`);
-                    await activateSession(session);
-                    terminal.show();
-                    return;
-                }
+    if (!config().get<boolean>('sessionWatcher')) {
+        void window.showInformationMessage('This command requires that r.sessionWatcher be enabled.');
+        return;
+    }
+    const terminal = window.activeTerminal;
+    const selectionRevision = ++sessionSelectionRevision;
+    const isCurrent = () => selectionRevision === sessionSelectionRevision && terminal === window.activeTerminal
+        && (!terminal || (!isTerminalClosed(terminal) && !terminal.exitStatus));
+    const focusOwner = (): Promise<void> | undefined => {
+        const owner = terminalRegistry.ownerOf(terminal);
+        if (!terminal || !owner) { return undefined; }
+        const activating = activateSession(owner);
+        const activationRevision = sessionSelectionRevision;
+        return activating.then(() => {
+            if (activationRevision === sessionSelectionRevision && terminalRegistry.ownerOf(terminal) === owner) {
+                terminal.show();
             }
-        }
+        });
+    };
+    const focused = focusOwner();
+    if (focused) { await focused; return; }
 
-        // Restore the selected managed terminal before focusing another session.
-        const discoveryPath = terminal && (terminalDiscoveryPath(terminal) ||
-            (pidArg ? await findDiscoveryFileForTerminal(pidArg) : undefined));
-        if (terminal && discoveryPath && !isTerminalClosed(terminal)) {
-            const command = await getAttachSessionCommand();
+    let discoveryPath = terminal && terminalDiscoveryPath(terminal);
+    if (terminal && !discoveryPath) {
+        const terminalPid = await terminal.processId;
+        if (!isCurrent()) { return; }
+        const focused = focusOwner();
+        if (focused) { await focused; return; }
+        discoveryPath = terminalPid ? await findDiscoveryFileForTerminal(terminalPid) : undefined;
+        if (!isCurrent()) { return; }
+    }
+    const sendAttachCommand = async (): Promise<void> => {
+        const command = await getAttachSessionCommand();
+        if (!isCurrent()) { return; }
+        const focused = focusOwner();
+        if (focused) { await focused; return; }
+        if (terminal && isLiveTerminal(terminal)) {
             terminal.sendText(command, true);
             terminal.show();
-            return;
         }
+    };
+    if (!isCurrent()) { return; }
+    const recovered = focusOwner();
+    if (recovered) { await recovered; return; }
+    if (terminal && discoveryPath) { await sendAttachCommand(); return; }
 
-        if (activeSession) {
-            console.info('[activateRSession] Focusing terminal of the active session');
-            for (const term of window.terminals) {
-                const termPid = await term.processId;
-                if (termPid && terminalSessions.get(String(termPid)) === activeSession) {
-                    term.show();
-                    return;
-                }
-            }
-        }
+    // Focus the same association that execution and readiness recognize.
+    const active = activeSession && terminalRegistry.forSession(activeSession);
+    if (active) { active.terminal.show(); return; }
 
-        if (config().get<boolean>('alwaysUseActiveTerminal')) {
-            if (terminal) {
-                const command = await getAttachSessionCommand();
-                terminal.sendText(command, true);
-                terminal.show();
-                return;
-            }
-
-            const action = await window.showInformationMessage(
-                'No active terminal is available. You can copy the attach command or create a managed R terminal.',
-                'Copy Attach Command',
-                'Create R Terminal'
-            );
-
-            if (action === 'Copy Attach Command') {
-                await connectToSession();
-                return;
-            }
-            if (action === 'Create R Terminal') {
-                await rTerminal.createRTerm();
-            }
-            return;
-        }
-
-        console.info('[activateRSession] Creating new R terminal');
-        await rTerminal.createRTerm();
-    } else {
-        void window.showInformationMessage('This command requires that r.sessionWatcher be enabled.');
+    if (config().get<boolean>('alwaysUseActiveTerminal')) {
+        if (terminal) { await sendAttachCommand(); return; }
+        const action = await window.showInformationMessage(
+            'No active terminal is available. You can copy the attach command or create a managed R terminal.',
+            'Copy Attach Command', 'Create R Terminal'
+        );
+        if (!isCurrent()) { return; }
+        if (action === 'Copy Attach Command') { await connectToSession(); }
+        else if (action === 'Create R Terminal') { await rTerminal.createRTerm(); }
+        return;
     }
+    await rTerminal.createRTerm();
 }
 
 export function removeDirectory(dir: string): void {
@@ -943,13 +1109,11 @@ async function runWorkspaceRefresh(): Promise<void> {
 
 export async function updateWorkspace() {
     const requestedSession = activeSession;
-    if (!globalPipePath || !requestedSession) {return;}
+    if ((!globalPipePath && !requestedSession?.requester) || !requestedSession || requestedSession.workspaceUnavailable) {return;}
     try {
-        const response = await sessionRequest({ method: 'workspace' });
-        if (response && activeSession === requestedSession) {
-            workspaceData = response as WorkspaceData;
-            requestedSession.workspaceData = workspaceData;
-            void rWorkspace?.refresh();
+        const response = await sessionRequest({ method: 'workspace' }, requestedSession);
+        if (response && sessions.get(requestedSession.sessionId) === requestedSession) {
+            updateSessionWorkspace(requestedSession, response as WorkspaceData);
             console.info('[updateWorkspace] Done');
         }
     } catch (e) {
@@ -989,21 +1153,28 @@ export function openExternalBrowser(): void {
     }
 }
 
-export async function showDataView(source: string, type: string, title: string, file: string, viewer: string, viewId?: string, dataViewSession = activeSession): Promise<void> {
+export async function showDataView(
+    source: string, type: string, title: string, file: string, viewer: string,
+    viewId?: string, navigation?: ListViewNavigation,
+    sessionId: string | null = activeSession?.sessionId ?? null,
+    stateGeneration?: number,
+): Promise<void> {
+    resDir ??= path.join(extensionContext.extensionPath, 'dist', 'resources');
     console.info(`[showDataView] source: ${source}, type: ${type}, title: ${title}, file: ${file}, viewer: ${viewer}, viewId: ${String(viewId ?? '')}`);
+    const panelKey = JSON.stringify([sessionId, viewId]);
 
     if (source === 'table') {
-        const panelKey = `${dataViewSession?.sessionId ?? ''}:${viewId ?? ''}`;
         if (viewId) {
             const existing = dynamicDataViewPanels.get(panelKey);
-            if (existing && dynamicDataViewSessions.get(existing)?.socket === dataViewSession?.socket) {
+            if (existing) {
+                if (stateGeneration !== undefined) {
+                    dynamicDataViewStateGenerations.set(existing, stateGeneration);
+                }
                 existing.title = title;
-                existing.reveal(ViewColumn[viewer as keyof typeof ViewColumn], true);
-                const content = await getTableHtml(existing.webview, undefined, title);
-                existing.webview.html = `${content}\n<!-- dataview-reload:${++dynamicDataViewReloadRevision} -->`;
+                existing.reveal(existing.viewColumn, true);
+                existing.webview.html = await getTableHtml(existing.webview, undefined, title, sessionId);
                 return;
             }
-            existing?.dispose();
         }
 
         const panel = window.createWebviewPanel('dataview', title,
@@ -1018,14 +1189,29 @@ export async function showDataView(source: string, type: string, title: string, 
                 localResourceRoots: [Uri.file(resDir)],
             });
         panel.iconPath = new UriIcon('open-preview');
-        if (viewId && dataViewSession) {
-            dynamicDataViewPanels.set(panelKey, panel);
-            dynamicDataViewSessions.set(panel, dataViewSession);
-            attachDynamicDataViewBridge(panel, viewId, title, dataViewSession);
+        attachViewerSessionBridge(panel, sessionId);
+        if (viewId) {
+            registerDataViewPanel(panel, panelKey, viewId, sessionId, stateGeneration);
+            attachDynamicDataViewBridge(panel, viewId, sessionId);
         }
-        const content = await getTableHtml(panel.webview, file || undefined, title);
+        const content = await getTableHtml(panel.webview, file || undefined, title, sessionId);
         panel.webview.html = content;
     } else if (source === 'list') {
+        if (viewId) {
+            const existing = dynamicDataViewPanels.get(panelKey);
+            if (existing) {
+                if (stateGeneration !== undefined) {
+                    dynamicDataViewStateGenerations.set(existing, stateGeneration);
+                }
+                existing.title = title;
+                existing.reveal(existing.viewColumn, true);
+                existing.webview.html = getListHtml(
+                    existing.webview, title, navigation, sessionId
+                );
+                return;
+            }
+        }
+
         const panel = window.createWebviewPanel('dataview', title,
             {
                 preserveFocus: true,
@@ -1037,9 +1223,64 @@ export async function showDataView(source: string, type: string, title: string, 
                 retainContextWhenHidden: true,
                 localResourceRoots: [Uri.file(resDir)],
             });
-        const content = await getListHtml(panel.webview, file, title);
-        panel.iconPath = new UriIcon('open-preview');
-        panel.webview.html = content;
+        panel.iconPath = new UriIcon('preview');
+        attachViewerSessionBridge(panel, sessionId);
+        if (viewId) {
+            registerDataViewPanel(panel, panelKey, viewId, sessionId, stateGeneration);
+            const webview = panel.webview;
+            webview.onDidReceiveMessage(async (message: {
+                message?: string; index?: number; start?: number; requestId?: number;
+                path?: number[]; documentGeneration?: number;
+            }) => {
+                if (message.documentGeneration !== documentGenerations.get(webview)) {
+                    return;
+                }
+                if (!Array.isArray(message.path) || !message.path.every(index => Number.isSafeInteger(index) && index > 0)) {
+                    return;
+                }
+                if (message.message === 'listview/navigate' ||
+                    (message.message === 'listview/view' && Number.isSafeInteger(message.index))) {
+                    const result = await sessionRequest({
+                        method: message.message === 'listview/navigate' ? 'listview_navigate' : 'listview_view',
+                        params: { view_id: viewId, index: message.index, path: message.path },
+                    }, sessionId) as ListViewNavigation | boolean | undefined;
+                    if (message.documentGeneration !== documentGenerations.get(webview)) {
+                        return;
+                    }
+                    const navigation = result && typeof result === 'object' && Array.isArray(result.breadcrumbs)
+                        ? result : undefined;
+                    if (navigation) {
+                        panel.title = navigation.title;
+                    }
+                    void webview.postMessage({
+                        message: 'listview/navigation',
+                        documentGeneration: message.documentGeneration,
+                        requestId: message.requestId,
+                        navigation,
+                        error: result ? undefined : 'Unable to open this item. Check the R session and try again.',
+                    });
+                } else if (message.message === 'listview/page' && typeof message.start === 'number' &&
+                    Number.isInteger(message.start) && typeof message.requestId === 'number') {
+                    const page = await sessionRequest({
+                        method: 'workspace_children',
+                        params: { view_id: viewId, start: message.start, path: message.path },
+                    }, sessionId) as { children?: unknown; next_start?: number | null } | undefined;
+                    if (message.documentGeneration !== documentGenerations.get(webview)) {
+                        return;
+                    }
+                    void webview.postMessage({
+                        message: 'listview/page',
+                        documentGeneration: message.documentGeneration,
+                        requestId: message.requestId,
+                        ...page,
+                        error: Array.isArray(page?.children) ? undefined : 'Unable to load items. Check the R session and try again.',
+                    });
+                }
+            });
+        }
+        panel.webview.html = getListHtml(
+            panel.webview, title, navigation, sessionId
+        );
     } else {
         await commands.executeCommand('vscode.open', Uri.file(file), {
             preserveFocus: true,
@@ -1050,9 +1291,45 @@ export async function showDataView(source: string, type: string, title: string, 
     console.info('[showDataView] Done');
 }
 
-export async function getTableHtml(webview: Webview, file: string | undefined, title: string): Promise<string> {
+function getViewerSessionHtml(sessionId: string | null): string {
+    const owner = sessions.get(sessionId ?? '');
+    if (!owner) { return ''; }
+    const exited = sessionProcessMonitor.hasExited(owner);
+    if (!exited && (!owner.pid || !owner.rVer)) { return ''; }
+    const info = escapeHtml(exited ? 'R: (not attached)' : formatSessionLabel(owner.rVer, owner.pid));
+    return `<span class="viewer-session" role="img" tabindex="0" aria-label="${info}" aria-describedby="viewer-session-tooltip"><span class="codicon codicon-info" aria-hidden="true"></span><span id="viewer-session-tooltip" class="viewer-session-tooltip" role="tooltip">${info}</span></span>`;
+}
+
+function attachViewerSessionBridge(panel: vscode.WebviewPanel, sessionId: string | null): void {
+    const owner = sessions.get(sessionId ?? '');
+    if (!owner || (!sessionProcessMonitor.hasExited(owner) && (!owner.pid || !owner.rVer))) { return; }
+    // Keep the original process identity after detaching, reconnecting or restarting.
+    const sourcePid = owner.pid;
+    const attachedLabel = formatSessionLabel(owner.rVer, sourcePid);
+    const refresh = (force = false) => {
+        const text = source.exited ? 'R: (not attached)' : attachedLabel;
+        if (force || text !== lastLabel) {
+            lastLabel = text;
+            void panel.webview.postMessage({ message: 'viewer-session/update', text });
+        }
+    };
+    const source = sessionProcessMonitor.observe(owner, refresh);
+    let lastLabel = source.exited ? 'R: (not attached)' : attachedLabel;
+    const received = panel.webview.onDidReceiveMessage((message: { message?: string }) => {
+        if (message?.message === 'viewer-session/ready') { refresh(true); }
+    });
+    panel.onDidDispose(() => { source.dispose(); received?.dispose(); });
+}
+
+export async function getTableHtml(
+    webview: Webview, file: string | undefined, title: string, sessionId: string | null = null,
+): Promise<string> {
+    const sessionHtml = getViewerSessionHtml(sessionId);
+    const codicons = webview.asWebviewUri(Uri.file(path.join(resDir, 'codicon.css'))).toString();
     const pageSize = config().get<number>('session.data.pageSize', 500);
     if (!file) {
+        const documentGeneration = ++documentGenerationRevision;
+        documentGenerations.set(webview, documentGeneration);
         return `
 <!DOCTYPE html>
 <html lang="en">
@@ -1060,6 +1337,7 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>${escapeHtml(title)}</title>
+    <link rel="stylesheet" href="${codicons}">
     <style media="only screen">
     html, body {
         height: 100%;
@@ -1230,6 +1508,7 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
     <script src="${String(webview.asWebviewUri(Uri.file(path.join(resDir, 'ag-grid-community.min.noStyle.js'))))}"></script>
     <script>
     const vscode = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi() : { postMessage: () => {} };
+    const documentGeneration = ${documentGeneration};
     let requestIdSeq = 1;
     const pending = new Map();
     let gridApi;
@@ -1419,6 +1698,7 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
                 console.log('[dataview] Sending request:', action, 'with payload:', payload);
                 vscode.postMessage({
                     message: 'dataview/request',
+                    documentGeneration,
                     action,
                     requestId,
                     ...payload,
@@ -1433,7 +1713,8 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
 
     window.addEventListener('message', (event) => {
         const data = event.data;
-        if (!data || data.message !== 'dataview/response') {
+        if (!data || data.message !== 'dataview/response' ||
+            data.documentGeneration !== documentGeneration) {
             return;
         }
         const entry = pending.get(data.requestId);
@@ -1472,6 +1753,12 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
         if (rowCountKnown) {
             filteredRows = init.totalRows;
             totalRows = init.totalRows;
+        }
+        if (init.live) {
+            const info = document.createElement('span');
+            info.textContent = 'Full data';
+            info.title = 'This view retains the full object without a copy. Reference edits may appear here. Reopen from the cell to refresh after edits. Sorting and filtering scan the full data.';
+            document.querySelector('#viewerControls').append(info);
         }
         const bigintFields = prepareViewerColumns(columns);
         if (rowCountKnown) {
@@ -1618,7 +1905,7 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
     </script>
 </head>
 <body>
-    ${getDataViewerToolbarHtml()}
+    ${getDataViewerToolbarHtml(sessionHtml)}
     <div id="gridContainer">
         <div id="myGrid" style="height: 100%;"></div>
         ${getDataViewerColumnPanelHtml()}
@@ -1628,6 +1915,7 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
             <button id="fetchRetryBtn" type="button">Retry</button>
         </div>
     </div>
+    <script>${getViewerSessionScript()}</script>
 </body>
 </html>
 `;
@@ -1641,6 +1929,7 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>${escapeHtml(title)}</title>
+    <link rel="stylesheet" href="${codicons}">
     <style media="only screen">
     html, body {
         height: 100%;
@@ -1787,18 +2076,28 @@ export async function getTableHtml(webview: Webview, file: string | undefined, t
     </script>
 </head>
 <body onload='onload()'>
-    ${getDataViewerToolbarHtml()}
+    ${getDataViewerToolbarHtml(sessionHtml)}
     <div id="gridContainer">
         <div id="myGrid" style="height: 100%;"></div>
         ${getDataViewerColumnPanelHtml()}
     </div>
+    <script>${getViewerSessionScript()}</script>
 </body>
 </html>
 `;
 }
 
-export async function getListHtml(webview: Webview, file: string, title: string): Promise<string> {
-    const content = await readContent(file, 'utf8');
+export function getListHtml(
+    webview: Webview,
+    title: string,
+    navigation?: ListViewNavigation,
+    sessionId: string | null = null,
+): string {
+    const documentGeneration = ++documentGenerationRevision;
+    documentGenerations.set(webview, documentGeneration);
+    const codicons = webview.asWebviewUri(
+        Uri.file(path.join(resDir, 'codicon.css'))
+    ).toString();
 
     return `
 <!doctype HTML>
@@ -1807,64 +2106,37 @@ export async function getListHtml(webview: Webview, file: string, title: string)
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>${escapeHtml(title)}</title>
-    <script src="${String(webview.asWebviewUri(Uri.file(path.join(resDir, 'jquery.min.js'))))}"></script>
-    <script src="${String(webview.asWebviewUri(Uri.file(path.join(resDir, 'jquery.json-viewer.js'))))}"></script>
-    <link href="${String(webview.asWebviewUri(Uri.file(path.join(resDir, 'jquery.json-viewer.css'))))}" rel="stylesheet">
-    <style type="text/css">
+    <link rel="stylesheet" href="${codicons}">
+    <style>
     body {
-        color: var(--vscode-editor-foreground);
+        margin: 0;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        color: var(--vscode-foreground);
         background-color: var(--vscode-editor-background);
+        font-family: var(--vscode-font-family);
+        font-size: var(--vscode-font-size);
     }
-
-    .json-document {
-        padding: 0 0;
-    }
-
-    pre#json-renderer {
-        font-family: var(--vscode-editor-font-family);
-        border: 0;
-    }
-
-    ul.json-dict, ol.json-array {
-        color: var(--vscode-symbolIcon-fieldForeground);
-        border-left: 1px dotted var(--vscode-editorLineNumber-foreground);
-    }
-
-    .json-literal {
-        color: var(--vscode-symbolIcon-variableForeground);
-    }
-
-    .json-string {
-        color: var(--vscode-symbolIcon-stringForeground);
-    }
-
-    a.json-toggle:before {
-        color: var(--vscode-button-secondaryBackground);
-    }
-
-    a.json-toggle:hover:before {
-        color: var(--vscode-button-secondaryHoverBackground);
-    }
-
-    a.json-placeholder {
-        color: var(--vscode-input-placeholderForeground);
-    }
+    ${listViewerStyle}
     </style>
-    <script>
-    var data = ${String(content)};
-    $(document).ready(function() {
-      var options = {
-        collapsed: false,
-        rootCollapsable: false,
-        withQuotes: false,
-        withLinks: true
-      };
-      $("#json-renderer").jsonViewer(data, options);
-    });
-    </script>
 </head>
-<body>
-    <pre id="json-renderer"></pre>
+<body class="r-list-viewer">
+    <div class="navigation">
+        <button id="back" class="back" title="Back" aria-label="Back" disabled><span class="codicon codicon-arrow-left" aria-hidden="true"></span>Back</button>
+        <nav id="breadcrumbs" class="breadcrumbs" aria-label="Object path"></nav>
+        <button id="reset" class="reset" title="Reset to initial view" aria-label="Reset to initial view"><span class="codicon codicon-discard" aria-hidden="true"></span>Reset</button>
+        ${getViewerSessionHtml(sessionId)}
+    </div>
+    <div id="navigation-status" class="navigation-status" role="status"></div>
+    <div id="list" class="list"></div>
+    <script>
+    ${getListViewerScript(documentGeneration, navigation ?? {
+        title, path: [], breadcrumbs: [{ label: title, path: [] }],
+    })}
+    ${getViewerSessionScript()}
+    </script>
 </body>
 </html>
 `;
@@ -1873,9 +2145,36 @@ export async function getListHtml(webview: Webview, file: string, title: string)
 import * as rstudioapi from './rstudioapi';
 
 export async function activateSession(session: Session): Promise<void> {
+    sessionSelectionRevision++;
     activeSession = session;
+    const refreshed = refreshActiveSession(session);
+    if (!session.workspaceUnavailable) { scheduleWorkspaceRefresh(); }
+    await refreshed;
+}
+
+/** Reconcile the selected connection before considering automatic attach selection. */
+function activateAttachedSession(
+    session: Session, previous: Session | undefined,
+    selectionRevision: number, selectedTerminal: vscode.Terminal | undefined,
+): Promise<void> {
+    // Replacing the selected connection preserves the user's logical session choice,
+    // even if that same session was reselected while discovery was pending.
+    if (previous && activeSession === previous) { return activateSession(session); }
+
+    // Automatic selection may not override a newer choice of a different session.
+    if (selectionRevision !== sessionSelectionRevision || selectedTerminal !== window.activeTerminal) {
+        return Promise.resolve();
+    }
+    const selected = terminalRegistry.associationFor(selectedTerminal);
+    const hasNativeTerminal = terminalRegistry.forSession(session)?.kind === 'native';
+    const shouldPreserveSelectedTerminal = hasNativeTerminal || selected?.kind === 'explicit';
+    const preferred = shouldPreserveSelectedTerminal ? selected?.session : undefined;
+    return activateSession(preferred ?? session);
+}
+
+async function refreshActiveSession(session: Session): Promise<void> {
     pipeClient = session.socket;
-    globalPipePath = session.pipePath;
+    if (!session.requester) { globalPipePath = session.pipePath; }
     pid = session.pid;
     rVer = session.rVer;
     info = session.info;
@@ -1884,24 +2183,26 @@ export async function activateSession(session: Session): Promise<void> {
     workspaceData = session.workspaceData;
 
     if (sessionStatusBarItem) {
-        sessionStatusBarItem.text = `R ${rVer}: ${pid}`;
-        sessionStatusBarItem.tooltip = `${info.version}\nProcess ID: ${pid}\nCommand: ${info.command}\nStart time: ${info.start_time}\nClick to attach to active terminal.`;
+        sessionStatusBarItem.text = formatSessionLabel(rVer, pid);
+        sessionStatusBarItem.tooltip = `${info.version || rVer}\nProcess ID: ${pid}\nCommand: ${info.command}\nStart time: ${info.start_time}\nClick to attach to active terminal.`;
         sessionStatusBarItem.show();
     }
-    await setContext('rSessionActive', true);
     rWorkspace?.refresh();
-    scheduleWorkspaceRefresh();
+    await setContext('rSessionActive', !session.workspaceUnavailable);
 }
 
 /** Activate a connected session by its stable protocol identity. */
-export async function activateSessionById(sessionId: string): Promise<boolean> {
-    if (!enableSessionWatcher || typeof sessionId !== 'string' || !sessionId.trim()) {
+export async function activateSessionById(sessionId: string, options?: RSessionActivationOptions): Promise<boolean> {
+    if (typeof sessionId !== 'string' || !sessionId.trim()) {
         return false;
     }
     const target = sessions.get(sessionId);
-    if (!target || !isCurrentSocket(target.socket) || target.socket.destroyed || !target.socket.writable) {
+    if (!enableSessionWatcher && !target?.requester) { return false; }
+    if (!target || !isConnectedSession(target)) {
         return false;
     }
+    const terminal = options?.terminal;
+    if (terminal && !terminalRegistry.bindExplicit(terminal, target)) { return false; }
     await activateSession(target);
     return true;
 }
@@ -1917,24 +2218,42 @@ function isLocalHost(host: string): boolean {
     return host.length > 0 && host.toLocaleLowerCase() === os.hostname().toLocaleLowerCase();
 }
 
-async function findLocalTerminalPid(rPid: string, ownerPid?: string): Promise<string | undefined> {
+interface NativeTerminalCandidate {
+    terminal: vscode.Terminal;
+    pid: string;
+    isCurrent: () => boolean;
+}
+
+async function findLocalTerminal(rPid: string): Promise<NativeTerminalCandidate | undefined> {
+    const candidates = new Map<number, NativeTerminalCandidate>();
     for (const terminal of window.terminals) {
+        const isCurrent = terminalRegistry.snapshot(terminal);
         const terminalPid = await terminal.processId;
-        if (terminalPid !== undefined && (String(terminalPid) === rPid || String(terminalPid) === ownerPid)) {
-            return String(terminalPid);
-        }
+        if (terminalPid === undefined || !isCurrent()) { continue; }
+        const candidate = { terminal, pid: String(terminalPid), isCurrent };
+        if (candidate.pid === rPid) { return candidate; }
+        candidates.set(terminalPid, candidate);
+    }
+    if (!candidates.size) { return undefined; }
+    // Prefer the nearest terminal ancestor; never associate a sibling process.
+    const ancestors = await getProcessAncestors(Number(rPid));
+    const attachedRPids = new Set([...sessions.values()]
+        .filter(session => isLocalHost(session.host) && !session.socket.destroyed)
+        .map(session => session.pid));
+    for (const pid of ancestors) {
+        // A connected R owns its descendants; they must not take over its console.
+        if (attachedRPids.has(String(pid))) { return undefined; }
+        const candidate = candidates.get(pid);
+        if (candidate?.isCurrent()) { return candidate; }
     }
     return undefined;
 }
 
 export async function switchSessionByTerminal(terminal: vscode.Terminal | undefined): Promise<void> {
-    const terminalPid = await terminal?.processId;
-    const session = terminalPid ? terminalSessions.get(String(terminalPid)) : undefined;
-    if (session) {
-        await activateSession(session);
-    } else {
-        resetStatusBar();
-    }
+    sessionSelectionRevision++;
+    const owner = terminalRegistry.ownerOf(terminal);
+    if (owner) { await activateSession(owner); }
+    else { resetStatusBar(); }
 }
 
 function sendToSocket(socket: IpcSocket, data: Record<string, unknown>): void {
@@ -1944,7 +2263,10 @@ function sendToSocket(socket: IpcSocket, data: Record<string, unknown>): void {
 }
 
 async function handleNotification(message: Record<string, unknown>, socket: IpcSocket) {
-    const method = String(message.method);
+    if (typeof message.method !== 'string') {
+        return;
+    }
+    const method = message.method;
     const params = (message.params as Record<string, unknown>) || {};
 
     switch (method) {
@@ -1953,7 +2275,7 @@ async function handleNotification(message: Record<string, unknown>, socket: IpcS
             if (session) {
                 session.busyDataView = typeof params.view_id === 'string' ? params.view_id : undefined;
                 // A page may begin after its panel was closed while R was busy.
-                if (session.busyDataView && !dynamicDataViewPanels.has(`${session.sessionId}:${session.busyDataView}`)) {
+                if (session.busyDataView && !dynamicDataViewPanels.has(JSON.stringify([session.sessionId, session.busyDataView]))) {
                     void interruptDataView(session, session.busyDataView);
                 }
             }
@@ -1964,7 +2286,7 @@ async function handleNotification(message: Record<string, unknown>, socket: IpcS
             const sessionId = typeof params.session_id === 'string' ? params.session_id.trim() : '';
             const host = typeof params.host === 'string' ? params.host : '';
             if (protocolVersion !== SESS_PROTOCOL_VERSION) {
-                const found = protocolVersion === undefined ? 'missing' : String(protocolVersion);
+                const found = protocolVersion === undefined ? 'missing' : JSON.stringify(protocolVersion);
                 void window.showErrorMessage(`Cannot attach R session: unsupported sess protocol version ${found}; this extension requires protocol version ${SESS_PROTOCOL_VERSION}.`);
                 socket.destroy();
                 return;
@@ -1974,8 +2296,8 @@ async function handleNotification(message: Record<string, unknown>, socket: IpcS
                 socket.destroy();
                 return;
             }
-            if (!params.tempdir || !params.wd) {
-                void window.showErrorMessage('Cannot attach R session: the sess attach handshake is missing session paths. Update the sess package and try again.');
+            if (typeof params.tempdir !== 'string' || !params.tempdir || typeof params.wd !== 'string' || !params.wd) {
+                void window.showErrorMessage('Cannot attach R session: the sess attach handshake has missing or invalid session paths. Update the sess package and try again.');
                 socket.destroy();
                 return;
             }
@@ -1991,12 +2313,11 @@ async function handleNotification(message: Record<string, unknown>, socket: IpcS
                 return;
             }
 
-            const rPid = params.pid === undefined || params.pid === null ? '' : String(params.pid);
-            const terminalPid = rPid && isLocalHost(host)
-                ? await findLocalTerminalPid(rPid, params.terminal_pid ? String(params.terminal_pid) : undefined)
-                : undefined;
+            const rPid = typeof params.pid === 'string' || typeof params.pid === 'number' ? String(params.pid) : '';
+            pendingSessionAttachments.set(sessionId, socket);
+            const selectionRevision = sessionSelectionRevision;
             const selectedTerminal = window.activeTerminal;
-            const selectedTerminalPid = terminalPid ? await selectedTerminal?.processId : undefined;
+            const candidate = rPid && isLocalHost(host) ? await findLocalTerminal(rPid) : undefined;
             if (socket.destroyed) {
                 return;
             }
@@ -2010,13 +2331,15 @@ async function handleNotification(message: Record<string, unknown>, socket: IpcS
                 }
                 return;
             }
+            if (pendingSessionAttachments.get(sessionId) !== socket) {
+                socket.destroy();
+                return;
+            }
+            pendingSessionAttachments.delete(sessionId);
+            const native = candidate?.isCurrent() ? candidate : undefined;
             const previous = sessions.get(sessionId);
             if (previous) {
-                for (const [key, associated] of terminalSessions.entries()) {
-                    if (associated === previous) {
-                        terminalSessions.delete(key);
-                    }
-                }
+                terminalRegistry.releaseSession(previous);
             }
             const session = new Session(
                 sessionId,
@@ -2026,10 +2349,6 @@ async function handleNotification(message: Record<string, unknown>, socket: IpcS
                 socket,
             );
             socket._sessionId = sessionId;
-            if (terminalPid) {
-                socket._terminalPid = Number(terminalPid);
-                terminalSessions.set(terminalPid, session);
-            }
             sessions.set(sessionId, session);
             if (previous && previous.socket !== socket) {
                 previous.socket.destroy();
@@ -2037,20 +2356,18 @@ async function handleNotification(message: Record<string, unknown>, socket: IpcS
             session.rVer = String(params.version);
             session.pid = rPid;
             session.info = (params.info as SessionInfo | undefined) ?? { version: session.rVer, command: '', start_time: '' };
-            session.sessionDir = String(params.tempdir);
-            session.workingDir = String(params.wd);
+            session.sessionDir = params.tempdir;
+            session.workingDir = params.wd;
 
-            // Reload does not trigger a terminal-selection event after every attach.
-            // Prefer its connected session when a terminal reconnects in the background.
-            const selectedSession = terminalPid && selectedTerminal === window.activeTerminal && selectedTerminalPid
-                ? terminalSessions.get(String(selectedTerminalPid))
-                : undefined;
-            await activateSession(selectedSession && !selectedSession.socket.destroyed ? selectedSession : session);
+            const terminalPid = native && terminalRegistry.attachNative(native.terminal, session) ? native.pid : undefined;
+            if (terminalPid) { socket._terminalPid = Number(terminalPid); }
+
+            await activateAttachedSession(session, previous, selectionRevision, selectedTerminal);
 
             console.info(`[startSessionWatcher] attach session ${sessionId} (${host || 'unknown'}:${rPid || 'unknown'}), terminal PID: ${terminalPid ?? 'unassociated'}`);
             purgeAddinPickerItems();
-            if (params.plot_url) {
-                await globalPlotManager?.showHttpgdPlot(String(params.plot_url));
+            if (typeof params.plot_url === 'string' && params.plot_url) {
+                await globalPlotManager?.showHttpgdPlot(params.plot_url);
             }
             scheduleWorkspaceRefresh(0);
             break;
@@ -2067,17 +2384,17 @@ async function handleNotification(message: Record<string, unknown>, socket: IpcS
             break;
         }
         case 'httpgd': {
-            if (params.url) {
-                await globalPlotManager?.showHttpgdPlot(String(params.url));
+            if (typeof params.url === 'string' && params.url) {
+                await globalPlotManager?.showHttpgdPlot(params.url);
             }
             break;
         }
         case 'browser':
         case 'page_viewer':
         case 'webview': {
-            if (params.url) {
-                const url = String(params.url);
-                const title = String(params.title ?? (method === 'browser' ? 'Browser' : method === 'page_viewer' ? 'Page Viewer' : 'Viewer'));
+            if (typeof params.url === 'string' && params.url) {
+                const url = params.url;
+                const title = typeof params.title === 'string' ? params.title : (method === 'browser' ? 'Browser' : method === 'page_viewer' ? 'Page Viewer' : 'Viewer');
 
                 const viewColumnConfig = config().get<Record<string, string>>('session.viewers.viewColumn') ?? {};
                 const configKey = method === 'page_viewer' ? 'pageViewer' : (method === 'browser' ? 'browser' : 'viewer');
@@ -2103,18 +2420,29 @@ async function handleNotification(message: Record<string, unknown>, socket: IpcS
             break;
         }
         case 'dataview': {
-            if (params.source && params.type && params.title) {
+            // R's deparse() can return several title lines. Preserve the
+            // comma-separated title previously produced by String(array).
+            const title = typeof params.title === 'string' ? params.title
+                : Array.isArray(params.title) && params.title.every((line: unknown) => typeof line === 'string')
+                    ? params.title.join(',') : undefined;
+            if (typeof params.source === 'string' && params.source
+                && typeof params.type === 'string' && params.type
+                && title
+                && (params.file === undefined || params.file === null || typeof params.file === 'string')
+                && (params.view_id === undefined || params.view_id === null || typeof params.view_id === 'string')) {
                 const viewColumnConfig = config().get<Record<string, string>>('session.viewers.viewColumn') ?? {};
                 const viewer = viewColumnConfig['view'] ?? 'Two';
                 if (viewer !== 'Disable') {
                     await showDataView(
-                        String(params.source),
-                        String(params.type),
-                        String(params.title),
-                        String(params.file ?? ''),
+                        params.source,
+                        params.type,
+                        title,
+                        params.file ?? '',
                         viewer,
-                        params.view_id ? String(params.view_id) : undefined,
-                        sessions.get(socket._sessionId ?? ''),
+                        params.view_id || undefined,
+                        params.navigation as ListViewNavigation | undefined,
+                        socket._sessionId ?? null,
+                        typeof params.state_generation === 'number' ? params.state_generation : undefined,
                     );
                 }
             }
@@ -2138,19 +2466,23 @@ async function handleNotification(message: Record<string, unknown>, socket: IpcS
 }
 
 export async function showHelpNotification(params: Record<string, unknown>): Promise<void> {
-    if (!globalRHelp || !params.requestPath) {
+    if (!globalRHelp || typeof params.requestPath !== 'string' || !params.requestPath) {
         return;
     }
 
     const viewer = config().get<Record<string, string>>('session.viewers.viewColumn')?.helpPanel ?? 'Two';
     if (viewer !== 'Disable') {
-        await globalRHelp.showHelpForPath(String(params.requestPath), viewer);
+        await globalRHelp.showHelpForPath(params.requestPath, viewer);
     }
 }
 
-async function handleRequest(message: Record<string, unknown>, socket: IpcSocket) {
-    if (message.method) {
-        const method = String(message.method);
+export async function handleEditorRequest(method: string, params: Record<string, unknown>): Promise<unknown> {
+    return handleRequest({ method, params });
+}
+
+async function handleRequest(message: Record<string, unknown>, socket?: IpcSocket) {
+    if (typeof message.method === 'string' && message.method) {
+        const method = message.method;
         const params = (message.params as Record<string, unknown>) || {};
         let result: unknown = null;
         let error: unknown = null;
@@ -2215,6 +2547,10 @@ async function handleRequest(message: Record<string, unknown>, socket: IpcSocket
             error = { code: -32603, message: String(e) };
         }
 
+        if (!socket) {
+            if (error) { throw new Error(JSON.stringify(error)); }
+            return result;
+        }
         sendToSocket(socket, {
             jsonrpc: '2.0',
             id: message.id,
@@ -2224,21 +2560,13 @@ async function handleRequest(message: Record<string, unknown>, socket: IpcSocket
     }
 }
 
-export function cleanupTerminalAssociation(terminalPid: string): void {
-    terminalSessions.delete(terminalPid);
-}
-
 export async function cleanupSession(sessionId: string, closingSocket?: IpcSocket): Promise<void> {
     const session = sessions.get(sessionId);
     if (!session || (closingSocket && session.socket !== closingSocket)) {
         return;
     }
     sessions.delete(sessionId);
-    for (const [terminalPid, associated] of terminalSessions.entries()) {
-        if (associated === session) {
-            terminalSessions.delete(terminalPid);
-        }
-    }
+    terminalRegistry.releaseSession(session);
     if (pipeClient === session.socket) {
         pipeClient = undefined;
     }
@@ -2246,20 +2574,19 @@ export async function cleanupSession(sessionId: string, closingSocket?: IpcSocke
         session.socket.destroy();
     }
     if (activeSession === session) {
-        deferWorkspaceRefresh();
-        workspaceRefreshPending = false;
-        resetStatusBar();
-        activeSession = undefined;
-        workspaceData.globalenv = {};
-        workspaceData.loaded_namespaces = [];
-        workspaceData.search = [];
-        rWorkspace?.refresh();
-        await setContext('rSessionActive', false);
+        await clearActiveSession();
     }
 }
 
-export async function sessionRequest(data: Record<string, unknown>, timeout = 5000, socket = pipeClient): Promise<unknown> {
+export async function sessionRequest(
+    data: Record<string, unknown>, target: Session | string | null | undefined = activeSession,
+    timeout = 5000,
+): Promise<unknown> {
     try {
+        const owner = typeof target === 'string' ? sessions.get(target) : target;
+        if (owner?.requester) { return await owner.requester(data); }
+        // An explicitly bound viewer must never fall back to the active session.
+        const socket = owner?.socket ?? (target === undefined ? pipeClient : undefined);
         if (!socket || socket.destroyed) {
             throw new Error('IPC socket is not connected');
         }
