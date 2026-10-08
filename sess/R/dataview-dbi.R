@@ -19,6 +19,47 @@ dataview_dbi_require <- function() {
   }
 }
 
+dataview_dbi_primary_key_query <- function(con, table) {
+  table <- dbplyr::as_table_path(table, con)
+  components <- dbplyr::table_path_components(table, con)[[1L]]
+  catalog <- if (length(components) == 3L) {
+    # dbplyr's SQL Server path parser retains escaped closing brackets.
+    gsub("]]", "]", components[[1L]], fixed = TRUE)
+  } else {
+    NULL
+  }
+  metadata_table <- function(name, vars) {
+    source <- if (is.null(catalog)) {
+      dbplyr::in_schema("sys", name)
+    } else {
+      dbplyr::in_catalog(catalog, "sys", name)
+    }
+    dplyr::tbl(con, source, vars = vars)
+  }
+  object_id <- dbplyr::translate_sql(OBJECT_ID(!!as.character(table), "U"), con = con)
+  indexes <- metadata_table("indexes", c("object_id", "index_id", "is_primary_key"))
+  index_columns <- metadata_table(
+    "index_columns", c("object_id", "index_id", "column_id", "key_ordinal")
+  )
+  columns <- metadata_table("columns", c("object_id", "column_id", "name"))
+
+  indexes |>
+    dplyr::filter(.data$object_id == !!object_id, .data$is_primary_key == 1L) |>
+    dplyr::inner_join(index_columns, by = c("object_id", "index_id")) |>
+    dplyr::inner_join(columns, by = c("object_id", "column_id")) |>
+    dplyr::filter(.data$key_ordinal > 0L) |>
+    dplyr::arrange(.data$key_ordinal) |>
+    dplyr::select(column_name = dplyr::all_of("name"))
+}
+
+dataview_dbi_primary_key <- function(con, table) {
+  # Metadata may be unavailable to the user; viewing the table must still work.
+  tryCatch(
+    as.character(dplyr::collect(dataview_dbi_primary_key_query(con, table))$column_name),
+    error = function(e) character()
+  )
+}
+
 dataview_dbi_source <- function(data) {
   dataview_dbi_require()
   con <- dbplyr::remote_con(data)
@@ -70,35 +111,7 @@ dataview_dbi_source <- function(data) {
     }
   }, character(1))
   row_identity <- if (bare_table) {
-    components <- dbplyr::table_path_components(source_sql, con)[[1L]]
-    catalog <- if (length(components) == 3L) {
-      paste0(as.character(DBI::dbQuoteIdentifier(con, components[[1L]])), ".")
-    } else {
-      ""
-    }
-    object_name <- paste(vapply(
-      components,
-      function(component) as.character(DBI::dbQuoteIdentifier(con, component)),
-      character(1)
-    ), collapse = ".")
-    tryCatch(
-      as.character(DBI::dbGetQuery(
-        con,
-        paste0(
-          "select c.name as column_name ",
-          "from ", catalog, "sys.indexes i ",
-          "inner join ", catalog, "sys.index_columns ic ",
-          "on i.object_id = ic.object_id and i.index_id = ic.index_id ",
-          "inner join ", catalog, "sys.columns c ",
-          "on ic.object_id = c.object_id and ic.column_id = c.column_id ",
-          "where i.object_id = object_id(",
-          as.character(DBI::dbQuoteLiteral(con, object_name)), ", 'U') ",
-          "and i.is_primary_key = 1 and ic.key_ordinal > 0 ",
-          "order by ic.key_ordinal"
-        )
-      )[[1L]]),
-      error = function(e) character()
-    )
+    dataview_dbi_primary_key(con, source_sql)
   } else {
     character()
   }
