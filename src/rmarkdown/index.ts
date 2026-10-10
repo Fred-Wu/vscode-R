@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { config } from '../util';
 import { 
     shouldDisplayChunkOptions, getChunks, getCurrentChunk,
-    getCodeLenses, isRDocument,
+    getCodeLenses, isRDocument, isWithinChunk,
     type RMarkdownChunk
 } from './chunks';
 
@@ -18,7 +18,7 @@ export class RMarkdownCodeLensProvider implements vscode.CodeLensProvider {
     public readonly onDidChangeCodeLenses: vscode.Event<void> = this._onDidChangeCodeLenses.event;
     private readonly currentCellTop: vscode.TextEditorDecorationType;
     private readonly currentCellBottom: vscode.TextEditorDecorationType;
-    private onDidChangeTextEditorSelectionHandler: vscode.Disposable | undefined;
+    private readonly listeners: vscode.Disposable[] = [];
 
     constructor() {
         this.decoration = vscode.window.createTextEditorDecorationType({
@@ -39,49 +39,48 @@ export class RMarkdownCodeLensProvider implements vscode.CodeLensProvider {
             isWholeLine: true
         });
 
-        // Register the event listener and store the disposable
-        this.onDidChangeTextEditorSelectionHandler = vscode.window.onDidChangeTextEditorSelection(
-            () => this.onDidChangeTextEditorSelection()
+        this.listeners.push(
+            vscode.window.onDidChangeTextEditorSelection(event => {
+                if (event.textEditor.document.languageId === 'r') {
+                    this.highlightCurrentChunk(getChunks(event.textEditor.document), event.textEditor.document);
+                }
+            }),
+            vscode.workspace.onDidChangeTextDocument(event => {
+                if (event.document.languageId === 'r') {
+                    this.highlightCurrentChunk(getChunks(event.document), event.document);
+                }
+            }),
+            vscode.workspace.onDidChangeConfiguration(event => {
+                if (event.affectsConfiguration('r.rmarkdown.showActiveCellBorder')) {
+                    for (const editor of vscode.window.visibleTextEditors) {
+                        if (editor.document.languageId === 'r') {
+                            this.highlightCurrentChunk(getChunks(editor.document), editor.document);
+                        }
+                    }
+                }
+            })
         );
     }
 
-    // Event handler for text editor selection change
-    private onDidChangeTextEditorSelection() {
-        // Get the active editor
-        const editor = vscode.window.activeTextEditor;
-        
-        if (editor) {
-            const document = editor.document;
-            const chunks = getChunks(document);
-
-            // Call highlightCurrentChunk with the updated chunks and document
-            this.highlight(chunks, document);
-        }
-    }
-
     private highlightCurrentChunk(chunks: RMarkdownChunk[], document: vscode.TextDocument) {
-        for (const editor of vscode.window.visibleTextEditors) {  
-            if (editor.document.uri.toString() === document.uri.toString()) {
-                const lines = document.getText().split(/\r?\n/);
-                const currentLine = editor.selection.active.line;
-                const currentChunk = getCurrentChunk(chunks, currentLine);      
-                
-                if (currentChunk) {
-                    // set top border
-                    const currentChunkStart = new vscode.Range(
-                        new vscode.Position(currentChunk.startLine, 0),
-                        new vscode.Position(currentChunk.startLine, lines[currentChunk.startLine].length)
-                    );
-                    editor.setDecorations(this.currentCellTop, [currentChunkStart]);
-
-                    // set bottom border
-                    const currentChunkEnd = new vscode.Range(
-                        new vscode.Position(currentChunk.endLine, 0),
-                        new vscode.Position(currentChunk.endLine, lines[currentChunk.endLine].length)
-                    );
-                    editor.setDecorations(this.currentCellBottom, [currentChunkEnd]);
-                }
+        const showBorders = config().get<boolean>('rmarkdown.showActiveCellBorder', true);
+        for (const editor of vscode.window.visibleTextEditors) {
+            if (editor.document.uri.toString() !== document.uri.toString()) {
+                continue;
             }
+            const currentLine = editor.selection.active.line;
+            // getCurrentChunk also selects the nearest chunk for navigation commands.
+            // Borders, unlike navigation, should only appear inside the active chunk.
+            const currentChunk = showBorders ? getCurrentChunk(chunks, currentLine) : undefined;
+            if (!currentChunk || !isWithinChunk(currentChunk, currentLine)) {
+                editor.setDecorations(this.currentCellTop, []);
+                editor.setDecorations(this.currentCellBottom, []);
+                continue;
+            }
+            const startLine = document.lineAt(currentChunk.startLine);
+            const endLine = document.lineAt(currentChunk.endLine);
+            editor.setDecorations(this.currentCellTop, [startLine.range]);
+            editor.setDecorations(this.currentCellBottom, [endLine.range]);
         }
     }
 
@@ -128,10 +127,12 @@ export class RMarkdownCodeLensProvider implements vscode.CodeLensProvider {
     
     // Clean-up
     dispose() {
-        // Unregister the event listener when the provider is disposed
-        if (this.onDidChangeTextEditorSelectionHandler) {
-            this.onDidChangeTextEditorSelectionHandler.dispose();
+        for (const listener of this.listeners) {
+            listener.dispose();
         }
+        this.decoration.dispose();
+        this.currentCellTop.dispose();
+        this.currentCellBottom.dispose();
     }
 }
 

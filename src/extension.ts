@@ -229,7 +229,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<apiImp
     context.subscriptions.push(new InteractiveManager(context));
 
     // register codelens and completion providers for r markdown and r files
-    vscode.languages.registerCodeLensProvider(['r', 'rmd'], new rmarkdown.RMarkdownCodeLensProvider());
+    const codeLensProvider = new rmarkdown.RMarkdownCodeLensProvider();
+    context.subscriptions.push(codeLensProvider, vscode.languages.registerCodeLensProvider(['r', 'rmd'], codeLensProvider));
     vscode.languages.registerCompletionItemProvider('rmd', new rmarkdown.RMarkdownCompletionItemProvider(), ' ', ',');
     vscode.languages.registerFoldingRangeProvider('r', new rmarkdown.RChunkFoldingProvider());
 
