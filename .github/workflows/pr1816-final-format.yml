@@ -1,0 +1,28 @@
+name: Validate and format PR 1816 patch
+on:
+  push:
+    branches:
+      - ci/pr1816-final-format
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Format staged TypeScript and output exact patch
+        run: |
+          pnpm exec oxfmt src/languageService.ts src/rTerminal.ts src/session.ts src/interactive/manager.ts src/test/integration/sessionCompletion.test.ts src/test/suite/languageService.test.ts src/test/suite/session.test.ts src/test/suite/sessionWorkspaceRefresh.test.ts
+          node <<'NODE'
+          const cp = require('node:child_process');
+          const paths = ['src/languageService.ts','src/rTerminal.ts','src/session.ts','src/interactive/manager.ts','src/test/integration/sessionCompletion.test.ts','src/test/suite/languageService.test.ts','src/test/suite/session.test.ts','src/test/suite/sessionWorkspaceRefresh.test.ts'];
+          const patch = cp.execFileSync('git', ['diff', '--', ...paths], {encoding:'utf8', maxBuffer: 5*1024*1024});
+          for(let i=0;i<patch.length;i+=1000) console.log('PATCH|'+(i/1000)+'|'+JSON.stringify(patch.slice(i,i+1000)));
+          console.log('PATCHEND|'+patch.length);
+          NODE
+          pnpm run typecheck
+          pnpm run lint
