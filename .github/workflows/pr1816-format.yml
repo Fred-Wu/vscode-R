@@ -1,0 +1,54 @@
+name: Format PR 1816 sources
+on:
+  push:
+    branches:
+      - ci/pr1816-oxfmt
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+      - run: pnpm install --frozen-lockfile
+      - name: Format and extract sources
+        run: |
+          pnpm exec oxfmt src/interactive/manager.ts src/languageService.ts src/rTerminal.ts src/session.ts src/test/integration/sessionCompletion.test.ts src/test/suite/languageService.test.ts src/test/suite/session.test.ts src/test/suite/sessionWorkspaceRefresh.test.ts
+          node <<'NODE'
+          const fs = require('node:fs');
+          const paths = ["src/interactive/manager.ts","src/languageService.ts","src/rTerminal.ts","src/session.ts","src/test/integration/sessionCompletion.test.ts","src/test/suite/languageService.test.ts","src/test/suite/session.test.ts","src/test/suite/sessionWorkspaceRefresh.test.ts"];
+          for (const path of paths) {
+            const content = fs.readFileSync(path, 'utf8');
+            for (let i = 0; i < content.length; i += 1000) {
+              console.log('FMT|' + path + '|' + (i / 1000) + '|' + JSON.stringify(content.slice(i, i + 1000)));
+            }
+            console.log('FMTEND|' + path + '|' + content.length);
+          }
+          NODE
+      - name: Validate formatting, types, lint, and node tests
+        run: |
+          pnpm run format:check
+          pnpm run typecheck
+          pnpm run lint
+          pnpm run pretest
+          pnpm run test:node
+      - name: Check R source
+        shell: Rscript {0}
+        run: |
+          install.packages("lintr")
+          results <- lintr::lint("./R/languageServer.R")
+          if (length(results)) {
+              print(results)
+              stop("R lintr findings")
+          }
+          results <- lintr::lint("./sess/R/handlers.R")
+          if (length(results)) {
+              print(results)
+              stop("sess R lintr findings")
+          }

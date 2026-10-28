@@ -171,7 +171,7 @@ suite('Session Communication', () => {
             'late-workspace', 'host', directory, () => Promise.resolve(undefined),
         );
         try {
-            assert.strictEqual(target.resource?.fsPath, directory);
+            assert.strictEqual(target.resource?.toString(), vscode.Uri.file(directory).toString());
             lookup.returns({ uri: vscode.Uri.file(directory), name: 'added', index: 0 });
             assert.strictEqual(vscode.workspace.getWorkspaceFolder(target.resource!)?.name, 'added');
         } finally {
